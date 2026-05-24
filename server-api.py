@@ -50,8 +50,8 @@ CATEGORIES_PATH = "categories.pkl"
 CONFIG_PATH = "config_balanced.pkl"
 
 # 关键词提取配置
-KEYWORD_TOP_N = 10           # 提取最多10个关键词
-KEYWORD_MIN_N = 3            # 至少提取3个关键词
+KEYWORD_TOP_N = 12           # 提取最多12个关键词
+KEYWORD_MIN_N = 5            # 至少提取5个关键词
 KEYWORD_WEIGHTED = True      # 使用TF-IDF加权
 
 # 停用词表

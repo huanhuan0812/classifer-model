@@ -385,7 +385,7 @@ def interactive_mode():
     print("\n" + "="*50)
     print("PPTX学科分类器 - 交互式预测模式（内存优化版）")
     print("="*50)
-    print("输入PPTX文件路径进行预测，输入 'quit' 'exit' 或 'bye' 退出")
+    print("输入PPTX文件路径进行预测，输入 'quit' 或 'exit' 退出")
     print("输入 'mem' 查看当前内存使用情况")
     print("提示：可以直接拖拽文件到命令行窗口")
     print("-"*50)

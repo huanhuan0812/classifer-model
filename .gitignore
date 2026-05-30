@@ -4,3 +4,7 @@ __pycache__/
 *.pkl
 *.keras
 *.h5
+test.py
+*.rar
+6 ac1.0 mixed 0.3+0.7 onnx best/
+info.txt

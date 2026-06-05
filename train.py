@@ -2,15 +2,18 @@
 # -*- coding: utf-8 -*-
 """
 PPTX学科分类器训练脚本 (TextCNN) - 优化版
-支持8类别：语文、数学、英语、物理、化学、生物、班会、政治
+支持8类别：语文、数学、英语、物理、化学、生物、班会
 核心特性：
-1. 文本权重80%，文件名权重20%（增强文本重要性）
+1. 文本权重70%，文件名权重30%（增强文本重要性）
 2. 文件名数据增强（模拟不同命名习惯）
 3. 多尺度卷积提取文本特征（增加kernel_size=2）
 4. 🔥 PPTX解析缓存（避免重复解析，大幅加速）
 5. 类别权重处理（解决小样本类别不平衡）
 6. 🎯 支持指定科目只使用缓存（跳过解析，仅从缓存读取）
 7. 👤 人名去除（在缓存阶段使用jieba识别并过滤人名）
+8. 📊 词表截断（限制在MAX_NB_WORDS，如20000词）
+9. 💾 自动保存无依赖的Tokenizer（用于推理）
+10. 📝 输出JSON格式词表（便于外部工具使用）
 """
 
 import os
@@ -48,13 +51,14 @@ CATEGORIES = ["语文", "数学", "英语", "物理", "化学", "生物", "班�
 SKIP_CATEGORIES = []  # 例如: ["语文", "数学"] 表示语文和数学只从缓存读取
 
 # 词向量配置（增强语义表示）
-MAX_NB_WORDS = 20000          # 扩大词表
+MAX_NB_WORDS = 20000          # 词表最大大小（在20000词处截断）
 MAX_SEQUENCE_LENGTH = 1000    # 增加序列长度
 EMBEDDING_DIM = 150           # 增强Embedding维度
 
 # 文件名特征配置
 MAX_FILENAME_LENGTH = 32
 FILENAME_EMBEDDING_DIM = 32
+MAX_FILENAME_WORDS = 5000     # 文件名词表最大大小
 
 # 平衡权重（增强文本重要性）
 TEXT_WEIGHT = 0.70            # 提高文本权重
@@ -850,6 +854,335 @@ def build_optimized_multimodal_model(vocab_size, max_seq_len, max_filename_len,
     return model
 
 
+def save_tokenizers_without_keras(text_tokenizer, filename_tokenizer, categories, config):
+    """
+    保存无Keras依赖的Tokenizer文件（用于推理）
+    在20000词处截断（只保留前MAX_NB_WORDS个词）
+    """
+    print("\n" + "="*50)
+    print("保存无依赖的Tokenizer文件（词表截断）")
+    print("="*50)
+    
+    # 处理文本Tokenizer - 截断到MAX_NB_WORDS
+    full_word_index = text_tokenizer.word_index
+    full_vocab_size = len(full_word_index)
+    
+    # 截断：只保留前MAX_NB_WORDS个最常见的词
+    # Tokenizer的word_index已经是按频率降序排列的
+    truncated_word_index = {}
+    truncated_index_word = {}
+    
+    for i, (word, idx) in enumerate(full_word_index.items()):
+        if i < MAX_NB_WORDS:
+            truncated_word_index[word] = idx
+            truncated_index_word[idx] = word
+    
+    actual_vocab_size = len(truncated_word_index)
+    
+    print(f"  文本Tokenizer:")
+    print(f"    - 原始词表大小: {full_vocab_size}")
+    print(f"    - 截断后词表大小: {actual_vocab_size} (限制在 {MAX_NB_WORDS})")
+    print(f"    - 截断比例: {(1 - actual_vocab_size/full_vocab_size)*100:.1f}%")
+    
+    text_tokenizer_data = {
+        'word_index': truncated_word_index,
+        'index_word': truncated_index_word,
+        'word_counts': {word: text_tokenizer.word_counts.get(word, 0) 
+                       for word in truncated_word_index.keys()},
+        'document_count': text_tokenizer.document_count,
+        'vocab_size': actual_vocab_size,
+        'max_words': MAX_NB_WORDS,
+        'is_truncated': True,
+        'original_vocab_size': full_vocab_size
+    }
+    
+    # 处理文件名Tokenizer - 截断到MAX_FILENAME_WORDS
+    full_filename_word_index = filename_tokenizer.word_index
+    full_filename_vocab_size = len(full_filename_word_index)
+    
+    truncated_filename_word_index = {}
+    truncated_filename_index_word = {}
+    
+    for i, (word, idx) in enumerate(full_filename_word_index.items()):
+        if i < MAX_FILENAME_WORDS:
+            truncated_filename_word_index[word] = idx
+            truncated_filename_index_word[idx] = word
+    
+    actual_filename_vocab_size = len(truncated_filename_word_index)
+    
+    print(f"\n  文件名Tokenizer:")
+    print(f"    - 原始词表大小: {full_filename_vocab_size}")
+    print(f"    - 截断后词表大小: {actual_filename_vocab_size} (限制在 {MAX_FILENAME_WORDS})")
+    print(f"    - 截断比例: {(1 - actual_filename_vocab_size/full_filename_vocab_size)*100:.1f}%")
+    
+    filename_tokenizer_data = {
+        'word_index': truncated_filename_word_index,
+        'index_word': truncated_filename_index_word,
+        'word_counts': {word: filename_tokenizer.word_counts.get(word, 0)
+                       for word in truncated_filename_word_index.keys()},
+        'document_count': filename_tokenizer.document_count,
+        'vocab_size': actual_filename_vocab_size,
+        'max_words': MAX_FILENAME_WORDS,
+        'is_truncated': True,
+        'original_vocab_size': full_filename_vocab_size
+    }
+    
+    # 保存文件
+    with open('text_tokenizer_none.pkl', 'wb') as f:
+        pickle.dump(text_tokenizer_data, f)
+    print(f"\n✅ 已保存: text_tokenizer_none.pkl")
+    
+    with open('filename_tokenizer_none.pkl', 'wb') as f:
+        pickle.dump(filename_tokenizer_data, f)
+    print(f"✅ 已保存: filename_tokenizer_none.pkl")
+    
+    # 保存类别和配置
+    with open('categories.pkl', 'wb') as f:
+        pickle.dump(categories, f)
+    
+    # 更新配置，记录截断信息
+    config['max_nb_words'] = MAX_NB_WORDS
+    config['max_filename_words'] = MAX_FILENAME_WORDS
+    config['actual_text_vocab_size'] = actual_vocab_size
+    config['actual_filename_vocab_size'] = actual_filename_vocab_size
+    
+    with open('config_optimized.pkl', 'wb') as f:
+        pickle.dump(config, f)
+    
+    print(f"✅ 已保存: categories.pkl")
+    print(f"✅ 已保存: config_optimized.pkl")
+    
+    # 打印汇总信息
+    print("\n" + "="*50)
+    print("📊 词表截断汇总:")
+    print(f"  文本: {full_vocab_size} → {actual_vocab_size} (保留前{MAX_NB_WORDS}词)")
+    print(f"  文件名: {full_filename_vocab_size} → {actual_filename_vocab_size} (保留前{MAX_FILENAME_WORDS}词)")
+    print(f"  建议 embedding_dim: {min(EMBEDDING_DIM, actual_vocab_size, actual_filename_vocab_size)}")
+    print("="*50)
+    
+    return text_tokenizer_data, filename_tokenizer_data
+
+
+def save_json_vocabularies(text_tokenizer, filename_tokenizer):
+    """
+    保存JSON格式的词表文件（截断在MAX_NB_WORDS和MAX_FILENAME_WORDS）
+    便于外部工具读取和使用
+    """
+    print("\n" + "="*50)
+    print("保存JSON格式词表文件")
+    print("="*50)
+    
+    # ========== 1. 保存文本词表 ==========
+    full_word_index = text_tokenizer.word_index
+    
+    # 截断：只保留前MAX_NB_WORDS个最常见的词
+    truncated_word_index = {}
+    truncated_word_counts = {}
+    
+    for i, (word, idx) in enumerate(full_word_index.items()):
+        if i < MAX_NB_WORDS:
+            truncated_word_index[word] = idx
+            truncated_word_counts[word] = text_tokenizer.word_counts.get(word, 0)
+    
+    # 构建文本词表JSON
+    text_vocab_json = {
+        "metadata": {
+            "type": "text_vocabulary",
+            "version": CACHE_VERSION,
+            "max_words": MAX_NB_WORDS,
+            "original_size": len(full_word_index),
+            "actual_size": len(truncated_word_index),
+            "is_truncated": True,
+            "created_at": datetime.now().isoformat(),
+            "description": "文本分类器的词表，按词频降序排列，仅保留前{}个最常见的词".format(MAX_NB_WORDS)
+        },
+        "vocabulary": [
+            {
+                "index": idx,
+                "word": word,
+                "frequency": truncated_word_counts.get(word, 0)
+            }
+            for word, idx in truncated_word_index.items()
+        ],
+        # 提供两种访问方式：按索引和按词
+        "word_to_index": truncated_word_index,
+        "index_to_word": {str(idx): word for word, idx in truncated_word_index.items()}
+    }
+    
+    # 按索引排序（方便查看）
+    text_vocab_json["vocabulary"].sort(key=lambda x: x["index"])
+    
+    # 保存文本词表
+    with open('text_vocabulary.json', 'w', encoding='utf-8') as f:
+        json.dump(text_vocab_json, f, ensure_ascii=False, indent=2)
+    print(f"✅ 已保存: text_vocabulary.json")
+    print(f"   - 词表大小: {len(truncated_word_index)} 词")
+    print(f"   - 原始大小: {len(full_word_index)} 词")
+    print(f"   - 文件大小: {os.path.getsize('text_vocabulary.json') / 1024:.1f} KB")
+    
+    # 同时保存一个更简洁的版本（仅词列表，按频率排序）
+    simple_text_vocab = {
+        "metadata": {
+            "type": "text_vocabulary_simple",
+            "max_words": MAX_NB_WORDS,
+            "actual_size": len(truncated_word_index)
+        },
+        "words_by_frequency": list(truncated_word_index.keys()),
+        "frequency_map": truncated_word_counts
+    }
+    
+    with open('text_vocabulary_simple.json', 'w', encoding='utf-8') as f:
+        json.dump(simple_text_vocab, f, ensure_ascii=False, indent=2)
+    print(f"✅ 已保存: text_vocabulary_simple.json")
+    
+    # ========== 2. 保存文件名词表 ==========
+    full_filename_word_index = filename_tokenizer.word_index
+    
+    # 截断
+    truncated_filename_word_index = {}
+    truncated_filename_word_counts = {}
+    
+    for i, (word, idx) in enumerate(full_filename_word_index.items()):
+        if i < MAX_FILENAME_WORDS:
+            truncated_filename_word_index[word] = idx
+            truncated_filename_word_counts[word] = filename_tokenizer.word_counts.get(word, 0)
+    
+    # 构建文件名词表JSON
+    filename_vocab_json = {
+        "metadata": {
+            "type": "filename_vocabulary",
+            "version": CACHE_VERSION,
+            "max_words": MAX_FILENAME_WORDS,
+            "original_size": len(full_filename_word_index),
+            "actual_size": len(truncated_filename_word_index),
+            "is_truncated": True,
+            "created_at": datetime.now().isoformat(),
+            "description": "文件名词表，按词频降序排列，仅保留前{}个最常见的词".format(MAX_FILENAME_WORDS)
+        },
+        "vocabulary": [
+            {
+                "index": idx,
+                "word": word,
+                "frequency": truncated_filename_word_counts.get(word, 0)
+            }
+            for word, idx in truncated_filename_word_index.items()
+        ],
+        "word_to_index": truncated_filename_word_index,
+        "index_to_word": {str(idx): word for word, idx in truncated_filename_word_index.items()}
+    }
+    
+    # 按索引排序
+    filename_vocab_json["vocabulary"].sort(key=lambda x: x["index"])
+    
+    # 保存文件名词表
+    with open('filename_vocabulary.json', 'w', encoding='utf-8') as f:
+        json.dump(filename_vocab_json, f, ensure_ascii=False, indent=2)
+    print(f"\n✅ 已保存: filename_vocabulary.json")
+    print(f"   - 词表大小: {len(truncated_filename_word_index)} 词")
+    print(f"   - 原始大小: {len(full_filename_word_index)} 词")
+    print(f"   - 文件大小: {os.path.getsize('filename_vocabulary.json') / 1024:.1f} KB")
+    
+    # 简洁版本
+    simple_filename_vocab = {
+        "metadata": {
+            "type": "filename_vocabulary_simple",
+            "max_words": MAX_FILENAME_WORDS,
+            "actual_size": len(truncated_filename_word_index)
+        },
+        "words_by_frequency": list(truncated_filename_word_index.keys()),
+        "frequency_map": truncated_filename_word_counts
+    }
+    
+    with open('filename_vocabulary_simple.json', 'w', encoding='utf-8') as f:
+        json.dump(simple_filename_vocab, f, ensure_ascii=False, indent=2)
+    print(f"✅ 已保存: filename_vocabulary_simple.json")
+    
+    # ========== 3. 保存词频统计报告 ==========
+    # 生成词频统计报告
+    word_frequencies = [(word, count) for word, count in truncated_word_counts.items()]
+    word_frequencies.sort(key=lambda x: x[1], reverse=True)
+    
+    # 前100个高频词
+    top_100_words = [
+        {"rank": i+1, "word": word, "frequency": freq}
+        for i, (word, freq) in enumerate(word_frequencies[:100])
+    ]
+    
+    # 词频分布统计
+    freq_buckets = {
+        "1-10": 0,
+        "11-50": 0,
+        "51-100": 0,
+        "101-500": 0,
+        "501-1000": 0,
+        "1001+": 0
+    }
+    
+    for _, freq in word_frequencies:
+        if freq <= 10:
+            freq_buckets["1-10"] += 1
+        elif freq <= 50:
+            freq_buckets["11-50"] += 1
+        elif freq <= 100:
+            freq_buckets["51-100"] += 1
+        elif freq <= 500:
+            freq_buckets["101-500"] += 1
+        elif freq <= 1000:
+            freq_buckets["501-1000"] += 1
+        else:
+            freq_buckets["1001+"] += 1
+    
+    word_frequency_report = {
+        "metadata": {
+            "type": "word_frequency_report",
+            "created_at": datetime.now().isoformat(),
+            "vocabulary_size": len(truncated_word_index),
+            "total_word_count": sum(truncated_word_counts.values())
+        },
+        "top_100_words": top_100_words,
+        "frequency_distribution": freq_buckets,
+        "statistics": {
+            "min_frequency": min(truncated_word_counts.values()) if truncated_word_counts else 0,
+            "max_frequency": max(truncated_word_counts.values()) if truncated_word_counts else 0,
+            "avg_frequency": sum(truncated_word_counts.values()) / len(truncated_word_counts) if truncated_word_counts else 0,
+            "median_frequency": sorted(truncated_word_counts.values())[len(truncated_word_counts)//2] if truncated_word_counts else 0
+        }
+    }
+    
+    with open('word_frequency_report.json', 'w', encoding='utf-8') as f:
+        json.dump(word_frequency_report, f, ensure_ascii=False, indent=2)
+    print(f"\n✅ 已保存: word_frequency_report.json")
+    
+    # ========== 4. 保存类别映射 ==========
+    category_mapping = {
+        "metadata": {
+            "type": "category_mapping",
+            "created_at": datetime.now().isoformat(),
+            "num_categories": len(CATEGORIES)
+        },
+        "categories": CATEGORIES,
+        "index_to_category": {str(i): cat for i, cat in enumerate(CATEGORIES)},
+        "category_to_index": {cat: i for i, cat in enumerate(CATEGORIES)}
+    }
+    
+    with open('category_mapping.json', 'w', encoding='utf-8') as f:
+        json.dump(category_mapping, f, ensure_ascii=False, indent=2)
+    print(f"✅ 已保存: category_mapping.json")
+    
+    # 打印汇总
+    print("\n" + "="*50)
+    print("📊 JSON词表文件汇总:")
+    print(f"  文本词表 (完整): text_vocabulary.json ({len(truncated_word_index)} 词)")
+    print(f"  文本词表 (简洁): text_vocabulary_simple.json")
+    print(f"  文件名词表 (完整): filename_vocabulary.json ({len(truncated_filename_word_index)} 词)")
+    print(f"  文件名词表 (简洁): filename_vocabulary_simple.json")
+    print(f"  词频统计报告: word_frequency_report.json")
+    print(f"  类别映射: category_mapping.json")
+    print("="*50)
+    
+    return True
+
+
 # ---------- 测试人名去除功能 ----------
 def test_name_removal():
     """测试人名去除功能"""
@@ -889,6 +1222,7 @@ def main():
     print(f"缓存: {'启用' if ENABLE_CACHE else '禁用'} (版本: {CACHE_VERSION})")
     print(f"类别权重: {'启用' if USE_CLASS_WEIGHTS else '禁用'}")
     print(f"人名去除: {'启用 (缓存阶段)' if REMOVE_PERSON_NAMES else '禁用'}")
+    print(f"词表截断: 限制在 {MAX_NB_WORDS} 词")
     
     if SKIP_CATEGORIES:
         print(f"🎯 仅缓存模式科目: {', '.join(SKIP_CATEGORIES)}")
@@ -942,18 +1276,28 @@ def main():
     print(f"验证集: {len(X_val_text)}")
     print(f"测试集: {len(X_test_text)}")
     
-    # 3. 构建Tokenizer
+    # 3. 构建Tokenizer（使用截断）
     print("\n步骤3: 构建词表并转换序列...")
+    print(f"  词表截断: 最多保留 {MAX_NB_WORDS} 个最常见的词")
     
+    # 文本Tokenizer - 使用截断
     text_tokenizer = Tokenizer(num_words=MAX_NB_WORDS, oov_token='<UNK>')
     text_tokenizer.fit_on_texts(X_train_text)
-    text_vocab_size = min(MAX_NB_WORDS, len(text_tokenizer.word_index) + 1)
-    print(f"文本词汇量: {len(text_tokenizer.word_index)}")
     
-    filename_tokenizer = Tokenizer(num_words=5000, oov_token='<UNK>')
+    # 实际词表大小（由于截断，不会超过MAX_NB_WORDS）
+    text_vocab_size = min(MAX_NB_WORDS, len(text_tokenizer.word_index) + 1)
+    
+    print(f"  文本原始词汇量: {len(text_tokenizer.word_index)}")
+    print(f"  文本实际使用词汇量: {text_vocab_size} (截断在 {MAX_NB_WORDS})")
+    
+    # 文件名Tokenizer - 使用截断
+    filename_tokenizer = Tokenizer(num_words=MAX_FILENAME_WORDS, oov_token='<UNK>')
     filename_tokenizer.fit_on_texts(X_train_filename)
-    filename_vocab_size = min(5000, len(filename_tokenizer.word_index) + 1)
-    print(f"文件名词汇量: {len(filename_tokenizer.word_index)}")
+    
+    filename_vocab_size = min(MAX_FILENAME_WORDS, len(filename_tokenizer.word_index) + 1)
+    
+    print(f"  文件名字典大小: {len(filename_tokenizer.word_index)}")
+    print(f"  文件名实际使用词汇量: {filename_vocab_size} (截断在 {MAX_FILENAME_WORDS})")
     
     def seq_and_pad_text(texts):
         seqs = text_tokenizer.texts_to_sequences(texts)
@@ -1046,16 +1390,17 @@ def main():
     print("混淆矩阵:")
     print(confusion_matrix(y_test, y_pred))
     
-    # 8. 保存模型
+    # 8. 保存模型和Tokenizer
     print("\n步骤7: 保存模型...")
     model.save('textcnn_optimized_classifier.keras')
+    
+    # 保存标准Tokenizer（用于可能的重训练）
     with open('text_tokenizer.pkl', 'wb') as f:
         pickle.dump(text_tokenizer, f)
     with open('filename_tokenizer.pkl', 'wb') as f:
         pickle.dump(filename_tokenizer, f)
-    with open('categories.pkl', 'wb') as f:
-        pickle.dump(CATEGORIES, f)
     
+    # 配置信息
     config = {
         'max_sequence_length': MAX_SEQUENCE_LENGTH,
         'max_filename_length': MAX_FILENAME_LENGTH,
@@ -1069,19 +1414,34 @@ def main():
         'cache_version': CACHE_VERSION,
         'skip_categories': SKIP_CATEGORIES,
         'use_class_weights': USE_CLASS_WEIGHTS,
-        'remove_person_names': REMOVE_PERSON_NAMES
+        'remove_person_names': REMOVE_PERSON_NAMES,
+        'max_nb_words': MAX_NB_WORDS,
+        'max_filename_words': MAX_FILENAME_WORDS
     }
-    with open('config_optimized.pkl', 'wb') as f:
-        pickle.dump(config, f)
     
-    print("="*50)
+    # 保存无Keras依赖的Tokenizer（截断版本，用于推理）
+    save_tokenizers_without_keras(text_tokenizer, filename_tokenizer, CATEGORIES, config)
+    
+    # 🆕 保存JSON格式的词表文件
+    save_json_vocabularies(text_tokenizer, filename_tokenizer)
+    
+    print("\n" + "="*50)
     print("训练完成！已保存以下文件:")
     print("  - textcnn_optimized_classifier.keras")
     print("  - best_model_optimized.keras")
-    print("  - text_tokenizer.pkl")
-    print("  - filename_tokenizer.pkl")
+    print("  - text_tokenizer.pkl (完整版)")
+    print("  - filename_tokenizer.pkl (完整版)")
+    print("  - text_tokenizer_none.pkl (无依赖版，截断)")
+    print("  - filename_tokenizer_none.pkl (无依赖版，截断)")
     print("  - categories.pkl")
     print("  - config_optimized.pkl")
+    print("\n📝 JSON词表文件:")
+    print("  - text_vocabulary.json (完整文本词表)")
+    print("  - text_vocabulary_simple.json (简洁文本词表)")
+    print("  - filename_vocabulary.json (完整文件名词表)")
+    print("  - filename_vocabulary_simple.json (简洁文件名词表)")
+    print("  - word_frequency_report.json (词频统计报告)")
+    print("  - category_mapping.json (类别映射)")
     print(f"\n缓存目录: {CACHE_DIR}/")
     print(f"  - text_cache_{CACHE_VERSION}.json")
     print(f"  - cache_metadata_{CACHE_VERSION}.json")

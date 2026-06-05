@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PPTX学科分类器 API服务
-提供RESTful API接口，返回JSON格式预测结果
-支持：单文件预测、批量预测、健康检查、关键词提取
+PPTX学科分类器 API服务 - 本地路径版本
+提供RESTful API接口，接收文件路径进行预测
+无文件上传功能，直接使用服务器本地路径
 """
 
 import os
@@ -13,7 +13,6 @@ import warnings
 import re
 import pickle
 import json
-import tempfile
 from pathlib import Path
 from datetime import datetime
 from collections import Counter
@@ -27,32 +26,30 @@ warnings.filterwarnings('ignore')
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
-# 导入tensorflow
-import tensorflow as tf
-tf.get_logger().setLevel('ERROR')
-tf.autograph.set_verbosity(0)
+# ONNX Runtime
+import onnxruntime as ort
 
-from tensorflow.keras.models import load_model
-from tensorflow.keras.preprocessing.sequence import pad_sequences
 import jieba
 import jieba.analyse
 from pptx import Presentation
 
 # 创建Flask应用
 app = Flask(__name__)
-CORS(app)  # 允许跨域请求
+CORS(app)
 
 # ---------- 配置 ----------
-MODEL_PATH = "textcnn_balanced_classifier.keras"
-TEXT_TOKENIZER_PATH = "text_tokenizer.pkl"
-FILENAME_TOKENIZER_PATH = "filename_tokenizer.pkl"
+ONNX_MODEL_PATH = "textcnn_classifier.onnx"
+TEXT_TOKENIZER_PATH = "text_tokenizer_none.pkl"
+FILENAME_TOKENIZER_PATH = "filename_tokenizer_none.pkl"
 CATEGORIES_PATH = "categories.pkl"
-CONFIG_PATH = "config_balanced.pkl"
+CONFIG_PATH = "config_optimized.pkl"
+
+# 模型词汇表大小
+MODEL_VOCAB_SIZE = 20000
 
 # 关键词提取配置
-KEYWORD_TOP_N = 12           # 提取最多12个关键词
-KEYWORD_MIN_N = 5            # 至少提取5个关键词
-KEYWORD_WEIGHTED = True      # 使用TF-IDF加权
+KEYWORD_TOP_N = 12
+KEYWORD_MIN_N = 5
 
 # 停用词表
 STOPWORDS = set([
@@ -66,7 +63,14 @@ STOPWORDS = set([
     '上', '下', '中', '大', '小', '多', '少', '高', '低', '长', '短'
 ])
 
-# 学科相关的高权重词（用于关键词加权）
+# 有意义的单字词
+MEANINGFUL_SINGLE_CHARS = {
+    '圆', '力', '氧', '氢', '碳', '钠', '酸', '碱', '盐', 
+    '电', '光', '声', '热', '诗', '词', '歌', '曲', '数',
+    '方', '程', '函', '数', '角', '形', '体', '积'
+}
+
+# 学科相关的高权重词
 SUBJECT_KEYWORDS = {
     '语文': ['古诗', '文言文', '散文', '小说', '诗歌', '作者', '阅读', '写作', '作文', '修辞', '语法', '汉字', '成语', '唐诗', '宋词'],
     '数学': ['函数', '方程', '几何', '代数', '三角', '数列', '概率', '统计', '向量', '导数', '积分', '公式', '定理', '证明', '计算'],
@@ -82,29 +86,127 @@ jieba.setLogLevel(logging.ERROR)
 logging.getLogger().setLevel(logging.ERROR)
 
 # ---------- 全局变量 ----------
-_model = None
+_session = None
 _text_tokenizer = None
 _filename_tokenizer = None
 _categories = None
 _config = None
-
-# 预测计数器（用于内存管理）
 _prediction_count = 0
+
+
+# ---------- 轻量级Tokenizer ----------
+class SimpleTokenizer:
+    def __init__(self, word_index, vocab_size, max_vocab_size=MODEL_VOCAB_SIZE):
+        self.original_word_index = word_index
+        self.max_vocab_size = max_vocab_size
+        self.vocab_size = vocab_size
+        
+        self.word_index = {}
+        self.oov_token = 1
+        
+        valid_words = []
+        for word, idx in word_index.items():
+            if 1 <= idx < max_vocab_size:
+                valid_words.append((word, idx))
+        
+        valid_words.sort(key=lambda x: x[1])
+        
+        for new_idx, (word, old_idx) in enumerate(valid_words, 1):
+            self.word_index[word] = new_idx
+        
+        self.compressed_size = len(self.word_index)
+        self.index_word = {v: k for k, v in self.word_index.items()}
+        
+        print(f"  Tokenizer压缩: 原始={len(word_index)} -> 压缩后={self.compressed_size}")
+    
+    def texts_to_sequences(self, texts):
+        sequences = []
+        for text in texts:
+            if isinstance(text, str):
+                words = text.split()
+                seq = []
+                for word in words:
+                    idx = self.word_index.get(word, self.oov_token)
+                    if idx >= self.max_vocab_size:
+                        idx = self.oov_token
+                    seq.append(idx)
+                sequences.append(seq)
+            else:
+                sequences.append([])
+        return sequences
+    
+    def get_vocab_info(self):
+        return {
+            'original_size': len(self.original_word_index),
+            'compressed_size': self.compressed_size,
+            'max_supported': self.max_vocab_size - 1,
+            'oov_token': self.oov_token
+        }
+
+
+def load_tokenizer_compressed(filepath, max_vocab_size=MODEL_VOCAB_SIZE):
+    with open(filepath, 'rb') as f:
+        data = pickle.load(f)
+    
+    if isinstance(data, dict) and 'word_index' in data:
+        word_index = data['word_index']
+    elif hasattr(data, 'word_index'):
+        word_index = data.word_index
+    else:
+        raise ValueError(f"不支持的tokenizer格式: {type(data)}")
+    
+    print(f"  📊 加载原始词表: {len(word_index)} 个词")
+    tokenizer = SimpleTokenizer(word_index, len(word_index), max_vocab_size)
+    return tokenizer
+
+
+# ---------- ONNX Runtime配置 ----------
+def get_onnx_session():
+    global _session
+    
+    if _session is not None:
+        return _session
+    
+    if not Path(ONNX_MODEL_PATH).exists():
+        raise FileNotFoundError(f"ONNX模型文件不存在: {ONNX_MODEL_PATH}")
+    
+    sess_options = ort.SessionOptions()
+    sess_options.enable_cpu_mem_arena = True
+    sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    sess_options.intra_op_num_threads = 1
+    sess_options.inter_op_num_threads = 1
+    
+    ort.set_default_logger_severity(3)
+    
+    available_providers = ort.get_available_providers()
+    print(f"可用的执行提供者: {available_providers}")
+    
+    providers = ['CPUExecutionProvider']
+    if 'CUDAExecutionProvider' in available_providers:
+        providers.append('CUDAExecutionProvider')
+    
+    try:
+        _session = ort.InferenceSession(
+            ONNX_MODEL_PATH, 
+            sess_options=sess_options,
+            providers=providers
+        )
+        print("✅ ONNX模型加载成功！")
+    except Exception as e:
+        print(f"❌ 模型加载失败: {e}")
+        raise
+    
+    return _session
 
 
 # ---------- 关键词提取函数 ----------
 def extract_keywords(text, top_n=KEYWORD_TOP_N, min_n=KEYWORD_MIN_N):
-    """
-    从文本中提取关键词
-    使用多种方法：TF-IDF、TextRank、词频统计
-    返回：关键词列表，按重要性排序
-    """
     if not text or len(text.strip()) < 10:
         return ["无足够文本内容"]
     
     keywords_set = set()
     
-    # 方法1：TF-IDF 提取
     try:
         tfidf_keywords = jieba.analyse.extract_tags(
             text, topK=top_n, withWeight=False, allowPOS=()
@@ -113,7 +215,6 @@ def extract_keywords(text, top_n=KEYWORD_TOP_N, min_n=KEYWORD_MIN_N):
     except:
         pass
     
-    # 方法2：TextRank 提取
     try:
         textrank_keywords = jieba.analyse.textrank(
             text, topK=top_n, withWeight=False, allowPOS=('ns', 'n', 'vn', 'v', 'an')
@@ -122,7 +223,6 @@ def extract_keywords(text, top_n=KEYWORD_TOP_N, min_n=KEYWORD_MIN_N):
     except:
         pass
     
-    # 方法3：词频统计（过滤停用词）
     words = jieba.cut(text, HMM=False)
     word_freq = Counter()
     for w in words:
@@ -130,28 +230,21 @@ def extract_keywords(text, top_n=KEYWORD_TOP_N, min_n=KEYWORD_MIN_N):
         if len(w) >= 2 and w not in STOPWORDS and not w.isdigit():
             word_freq[w] += 1
     
-    # 取频率最高的词
     freq_keywords = [w for w, _ in word_freq.most_common(top_n)]
     keywords_set.update(freq_keywords[:top_n//2])
     
-    # 方法4：学科相关关键词匹配（提高相关性）
     for category, subject_words in SUBJECT_KEYWORDS.items():
         for sw in subject_words:
             if sw in text and len(sw) >= 2:
                 keywords_set.add(sw)
     
-    # 转换为列表并排序
     keywords = list(keywords_set)
     
-    # 按在文本中的位置和长度重新排序（更重要的词排在前面）
     def keyword_score(kw):
         score = 0
-        # 长度加分（2-4字最佳）
         if 2 <= len(kw) <= 4:
             score += 10
-        # 在文本中出现次数
         score += text.count(kw) * 5
-        # 学科关键词加分
         for subject_words in SUBJECT_KEYWORDS.values():
             if kw in subject_words:
                 score += 20
@@ -160,9 +253,7 @@ def extract_keywords(text, top_n=KEYWORD_TOP_N, min_n=KEYWORD_MIN_N):
     
     keywords.sort(key=keyword_score, reverse=True)
     
-    # 确保返回 min_n 到 top_n 个关键词
     if len(keywords) < min_n:
-        # 如果关键词不足，添加原始文本中的常见词
         common_words = [w for w, _ in word_freq.most_common(top_n * 2) 
                        if w not in keywords and len(w) >= 2]
         keywords.extend(common_words[:min_n - len(keywords)])
@@ -171,13 +262,9 @@ def extract_keywords(text, top_n=KEYWORD_TOP_N, min_n=KEYWORD_MIN_N):
 
 
 def extract_filename_keywords(filename_text, top_n=5):
-    """
-    从文件名中提取关键词
-    """
     if not filename_text:
         return []
     
-    # 文件名通常较短，直接分词后过滤
     words = jieba.cut(filename_text, HMM=False)
     keywords = []
     for w in words:
@@ -185,7 +272,6 @@ def extract_filename_keywords(filename_text, top_n=5):
         if len(w) >= 2 and w not in STOPWORDS and not w.isdigit():
             keywords.append(w)
     
-    # 去重并限制数量
     seen = set()
     unique_keywords = []
     for kw in keywords:
@@ -198,48 +284,76 @@ def extract_filename_keywords(filename_text, top_n=5):
 
 # ---------- 模型加载 ----------
 def load_models():
-    """加载模型和分词器"""
-    global _model, _text_tokenizer, _filename_tokenizer, _categories, _config
+    global _text_tokenizer, _filename_tokenizer, _categories, _config, _session
     
-    print("正在加载模型...", end=' ', flush=True)
-    _model = load_model(MODEL_PATH, compile=False)
-    print("✓", end=' ')
+    required_files = [
+        (ONNX_MODEL_PATH, "ONNX模型"),
+        (TEXT_TOKENIZER_PATH, "文本分词器"),
+        (FILENAME_TOKENIZER_PATH, "文件名词典"),
+        (CATEGORIES_PATH, "类别映射"),
+        (CONFIG_PATH, "配置")
+    ]
     
-    print("加载文本分词器...", end=' ', flush=True)
-    with open(TEXT_TOKENIZER_PATH, 'rb') as f:
-        _text_tokenizer = pickle.load(f)
-    print("✓", end=' ')
+    for filepath, desc in required_files:
+        if not Path(filepath).exists():
+            raise FileNotFoundError(f"{desc}文件不存在: {filepath}")
     
-    print("加载文件名词典...", end=' ', flush=True)
-    with open(FILENAME_TOKENIZER_PATH, 'rb') as f:
-        _filename_tokenizer = pickle.load(f)
-    print("✓", end=' ')
+    print("\n📚 加载模型组件...")
+    print("-" * 40)
+    
+    print("加载文本分词器...", flush=True)
+    _text_tokenizer = load_tokenizer_compressed(TEXT_TOKENIZER_PATH, MODEL_VOCAB_SIZE)
+    
+    print("加载文件名词典...", flush=True)
+    _filename_tokenizer = load_tokenizer_compressed(FILENAME_TOKENIZER_PATH, MODEL_VOCAB_SIZE)
     
     print("加载类别映射...", end=' ', flush=True)
     with open(CATEGORIES_PATH, 'rb') as f:
         _categories = pickle.load(f)
-    print("✓", end=' ')
+    print("✓")
     
     print("加载配置...", end=' ', flush=True)
     with open(CONFIG_PATH, 'rb') as f:
         _config = pickle.load(f)
     print("✓")
     
-    print(f"\n模型已就绪！支持 {len(_categories)} 个类别: {', '.join(_categories)}")
+    print("-" * 40)
+    print(f"支持 {len(_categories)} 个类别: {', '.join(_categories)}")
     
-    # 预热模型
-    try:
-        dummy_text = np.zeros((1, _config['max_sequence_length']), dtype=np.int32)
-        dummy_filename = np.zeros((1, _config['max_filename_length']), dtype=np.int32)
-        _model.predict([dummy_text, dummy_filename], verbose=0)
-        print("模型预热完成\n")
-    except:
-        pass
+    _session = get_onnx_session()
+    
+    text_info = _text_tokenizer.get_vocab_info()
+    filename_info = _filename_tokenizer.get_vocab_info()
+    
+    print(f"\n词表信息汇总:")
+    print(f"  文本词表: {text_info['compressed_size']}/{text_info['original_size']} 个词")
+    print(f"  文件名词表: {filename_info['compressed_size']}/{filename_info['original_size']} 个词")
+    print()
+
+
+def pad_sequences(sequences, maxlen, padding='post', truncating='post'):
+    if not sequences:
+        return np.zeros((0, maxlen), dtype=np.int32)
+    
+    result = np.zeros((len(sequences), maxlen), dtype=np.int32)
+    
+    for i, seq in enumerate(sequences):
+        if truncating == 'post':
+            seq = seq[:maxlen]
+        else:
+            seq = seq[-maxlen:] if len(seq) > maxlen else seq
+        
+        if padding == 'post':
+            result[i, :len(seq)] = seq
+        else:
+            if len(seq) > 0:
+                result[i, -len(seq):] = seq
+    
+    return result
 
 
 # ---------- PPTX 文本提取 ----------
 def extract_text_from_pptx(pptx_path):
-    """从PPTX文件中提取所有文本内容"""
     text_parts = []
     prs = None
     
@@ -278,8 +392,6 @@ def extract_text_from_pptx(pptx_path):
                     text_parts.append(slide.shapes.title.text.strip())
             except:
                 pass
-            
-            del slide
         
         result = " ".join(text_parts)
         
@@ -289,14 +401,12 @@ def extract_text_from_pptx(pptx_path):
         if prs is not None:
             del prs
         text_parts.clear()
-        del text_parts
     
     return result
 
 
 # ---------- 文本预处理 ----------
 def clean_text(text):
-    """基础清洗"""
     if not text:
         return ""
     
@@ -308,7 +418,6 @@ def clean_text(text):
 
 
 def cut_words(text):
-    """分词并过滤停用词"""
     if not text:
         return ""
     
@@ -327,15 +436,10 @@ def cut_words(text):
     if not filtered:
         return "空文本"
     
-    result = " ".join(filtered)
-    filtered.clear()
-    del filtered
-    
-    return result
+    return " ".join(filtered)
 
 
 def extract_filename_features(filepath):
-    """提取文件名特征"""
     filepath_obj = Path(filepath) if isinstance(filepath, str) else filepath
     filename = filepath_obj.stem
     
@@ -358,19 +462,15 @@ def extract_filename_features(filepath):
     if not filtered:
         return cleaned
     
-    result = " ".join(filtered)
-    filtered.clear()
-    del filtered
-    
-    return result
+    return " ".join(filtered)
 
 
-# ---------- 核心预测函数 ----------
-def predict_pptx_internal(filepath):
+# ---------- 核心预测函数（接收路径）----------
+def predict_pptx_by_path(filepath):
     """
-    内部预测函数，返回完整结果（包含关键词）
+    预测函数，直接接收文件路径
     """
-    global _model, _text_tokenizer, _filename_tokenizer, _categories, _config, _prediction_count
+    global _session, _text_tokenizer, _filename_tokenizer, _categories, _config, _prediction_count
     
     filepath = Path(filepath)
     
@@ -385,7 +485,6 @@ def predict_pptx_internal(filepath):
         cleaned = clean_text(raw_text)
         text_feature = cut_words(cleaned)
         text_available = True
-        # 提取关键词（使用原始文本，而非清洗后的）
         keywords = extract_keywords(raw_text)
         filename_keywords = extract_filename_keywords(filename_feature)
     else:
@@ -396,41 +495,47 @@ def predict_pptx_internal(filepath):
     
     # 转换为序列
     text_seq = _text_tokenizer.texts_to_sequences([text_feature])
-    text_pad = pad_sequences(text_seq, maxlen=_config['max_sequence_length'], 
-                            padding='post', truncating='post')
+    text_pad = pad_sequences(
+        text_seq, 
+        maxlen=_config.get('max_sequence_length', 750),
+        padding='post', 
+        truncating='post'
+    )
     
     filename_seq = _filename_tokenizer.texts_to_sequences([filename_feature])
-    filename_pad = pad_sequences(filename_seq, maxlen=_config['max_filename_length'],
-                                padding='post', truncating='post')
+    filename_pad = pad_sequences(
+        filename_seq, 
+        maxlen=_config.get('max_filename_length', 30),
+        padding='post', 
+        truncating='post'
+    )
     
-    # 预测
-    import io
-    old_stdout = sys.stdout
-    sys.stdout = io.StringIO()
+    text_pad = text_pad.astype(np.int32)
+    filename_pad = filename_pad.astype(np.int32)
     
-    try:
-        predictions = _model.predict([text_pad, filename_pad], verbose=0, batch_size=1)
-    finally:
-        sys.stdout = old_stdout
+    # ONNX推理
+    input_names = [inp.name for inp in _session.get_inputs()]
+    output_names = [out.name for out in _session.get_outputs()]
     
-    # 获取结果
-    pred_idx = predictions.argmax()
+    inputs = {
+        input_names[0]: text_pad,
+        input_names[1]: filename_pad
+    }
+    
+    predictions = _session.run(output_names, inputs)[0]
+    
+    pred_idx = int(predictions[0].argmax())
     confidence = float(predictions[0][pred_idx])
     predicted_class = _categories[pred_idx]
     
-    # 获取所有类别的置信度
     all_probabilities = {
         cat: float(predictions[0][i]) 
         for i, cat in enumerate(_categories)
     }
     
-    # 释放内存
-    del text_seq, text_pad, filename_seq, filename_pad, predictions
-    
     _prediction_count += 1
     if _prediction_count % 5 == 0:
         gc.collect()
-        tf.keras.backend.clear_session()
     
     return {
         'filename': filepath.name,
@@ -452,8 +557,9 @@ def health_check():
     """健康检查接口"""
     return jsonify({
         'status': 'healthy',
-        'model_loaded': _model is not None,
+        'model_loaded': _session is not None,
         'categories': _categories,
+        'backend': 'onnxruntime',
         'timestamp': datetime.now().isoformat()
     })
 
@@ -461,43 +567,38 @@ def health_check():
 @app.route('/predict', methods=['POST'])
 def predict_single():
     """
-    单文件预测接口
-    请求：POST multipart/form-data，文件字段名为 'file'
-    返回：JSON格式的预测结果（包含关键词）
+    单文件预测接口（接收文件路径）
+    请求：POST JSON格式
+    {
+        "filepath": "/path/to/your/file.pptx"
+    }
     """
-    if _model is None:
+    if _session is None:
         return jsonify({'error': '模型未加载'}), 503
     
-    # 检查是否有文件上传
-    if 'file' not in request.files:
-        return jsonify({'error': '请上传PPTX文件', 'required_field': 'file'}), 400
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': '请求体必须是JSON格式'}), 400
     
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({'error': '未选择文件'}), 400
+    filepath = data.get('filepath')
+    if not filepath:
+        return jsonify({'error': '请提供文件路径', 'required_field': 'filepath'}), 400
     
-    # 检查文件类型
-    if not file.filename.lower().endswith(('.pptx', '.ppt')):
-        return jsonify({'error': '不支持的文件格式，请上传PPTX或PPT文件'}), 400
+    # 支持相对路径转换为绝对路径
+    filepath = os.path.abspath(filepath)
     
-    # 保存临时文件
-    temp_file = None
+    # 检查文件扩展名
+    if not filepath.lower().endswith(('.pptx', '.ppt')):
+        return jsonify({'error': '不支持的文件格式，请提供PPTX或PPT文件'}), 400
+    
     try:
-        with tempfile.NamedTemporaryFile(suffix='.pptx', delete=False) as tmp:
-            file.save(tmp.name)
-            temp_file = tmp.name
+        result = predict_pptx_by_path(filepath)
         
-        # 预测
-        result = predict_pptx_internal(temp_file)
-        
-        # 添加额外信息
         result['success'] = True
         result['top_3'] = sorted(
             result['all_probabilities'].items(), 
             key=lambda x: x[1], reverse=True
         )[:3]
-        
-        # 添加关键词统计
         result['keyword_count'] = len(result['keywords'])
         
         return jsonify(result)
@@ -506,72 +607,67 @@ def predict_single():
         return jsonify({'error': str(e)}), 404
     except Exception as e:
         return jsonify({'error': f'预测失败: {str(e)}'}), 500
-    finally:
-        # 清理临时文件
-        if temp_file and os.path.exists(temp_file):
-            try:
-                os.unlink(temp_file)
-            except:
-                pass
 
 
 @app.route('/predict/batch', methods=['POST'])
 def predict_batch():
     """
-    批量文件预测接口
-    请求：POST multipart/form-data，文件字段名为 'files'（多文件）
-    返回：JSON格式的批量预测结果（包含关键词）
+    批量预测接口
+    请求：POST JSON格式
+    {
+        "filepaths": ["/path/to/file1.pptx", "/path/to/file2.pptx"]
+    }
     """
-    if _model is None:
+    if _session is None:
         return jsonify({'error': '模型未加载'}), 503
     
-    if 'files' not in request.files:
-        return jsonify({'error': '请上传PPTX文件', 'required_field': 'files'}), 400
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': '请求体必须是JSON格式'}), 400
     
-    files = request.files.getlist('files')
-    if not files or len(files) == 0:
-        return jsonify({'error': '未选择任何文件'}), 400
-    
-    # 过滤有效文件
-    valid_files = [f for f in files if f.filename and f.filename.lower().endswith(('.pptx', '.ppt'))]
-    
-    if len(valid_files) == 0:
-        return jsonify({'error': '没有有效的PPTX文件，请上传.pptx或.ppt格式的文件'}), 400
+    filepaths = data.get('filepaths', [])
+    if not filepaths or len(filepaths) == 0:
+        return jsonify({'error': '请提供文件路径列表', 'required_field': 'filepaths'}), 400
     
     results = []
     errors = []
     
-    for file in valid_files:
-        temp_file = None
+    for filepath in filepaths:
+        filepath = os.path.abspath(filepath)
+        
+        if not filepath.lower().endswith(('.pptx', '.ppt')):
+            errors.append({
+                'success': False,
+                'filepath': filepath,
+                'error': '不支持的文件格式'
+            })
+            continue
+        
         try:
-            with tempfile.NamedTemporaryFile(suffix='.pptx', delete=False) as tmp:
-                file.save(tmp.name)
-                temp_file = tmp.name
-            
-            result = predict_pptx_internal(temp_file)
+            result = predict_pptx_by_path(filepath)
             results.append({
                 'success': True,
+                'filepath': result['filepath'],
                 'filename': result['filename'],
                 'predicted_class': result['predicted_class'],
                 'confidence': result['confidence'],
                 'text_available': result['text_available'],
                 'text_length': result['text_length'],
-                'keywords': result['keywords'][:5],  # 批量时只返回前5个关键词
+                'keywords': result['keywords'][:5],
                 'filename_keywords': result['filename_keywords']
             })
-            
+        except FileNotFoundError as e:
+            errors.append({
+                'success': False,
+                'filepath': filepath,
+                'error': str(e)
+            })
         except Exception as e:
             errors.append({
                 'success': False,
-                'filename': file.filename,
-                'error': str(e)
+                'filepath': filepath,
+                'error': f'预测失败: {str(e)}'
             })
-        finally:
-            if temp_file and os.path.exists(temp_file):
-                try:
-                    os.unlink(temp_file)
-                except:
-                    pass
     
     # 统计信息
     summary = {}
@@ -582,88 +678,14 @@ def predict_batch():
     
     return jsonify({
         'success': True,
-        'total': len(valid_files),
+        'total': len(filepaths),
         'success_count': len(results),
         'error_count': len(errors),
         'summary': summary,
         'results': results,
         'errors': errors,
-        'timestamp': datetime.now().isoformat()
-    })
-
-
-@app.route('/predict/url', methods=['POST'])
-def predict_from_url():
-    """
-    从URL下载文件并预测
-    请求：JSON格式，包含 'url' 字段
-    返回：JSON格式的预测结果（包含关键词）
-    """
-    if _model is None:
-        return jsonify({'error': '模型未加载'}), 503
-    
-    data = request.get_json()
-    if not data or 'url' not in data:
-        return jsonify({'error': '请提供文件URL', 'required_field': 'url'}), 400
-    
-    url = data['url']
-    
-    # 检查URL是否指向PPTX文件
-    if not url.lower().endswith(('.pptx', '.ppt')):
-        return jsonify({'error': 'URL必须指向PPTX或PPT文件'}), 400
-    
-    temp_file = None
-    try:
-        import urllib.request
-        
-        # 下载文件
-        with tempfile.NamedTemporaryFile(suffix='.pptx', delete=False) as tmp:
-            urllib.request.urlretrieve(url, tmp.name)
-            temp_file = tmp.name
-        
-        # 预测
-        result = predict_pptx_internal(temp_file)
-        
-        result['success'] = True
-        result['source_url'] = url
-        result['top_3'] = sorted(
-            result['all_probabilities'].items(), 
-            key=lambda x: x[1], reverse=True
-        )[:3]
-        
-        return jsonify(result)
-        
-    except Exception as e:
-        return jsonify({'error': f'下载或预测失败: {str(e)}'}), 500
-    finally:
-        if temp_file and os.path.exists(temp_file):
-            try:
-                os.unlink(temp_file)
-            except:
-                pass
-
-
-@app.route('/keywords/extract', methods=['POST'])
-def extract_keywords_only():
-    """
-    仅提取关键词接口（不进行预测）
-    请求：POST JSON格式，包含 'text' 字段
-    返回：提取的关键词
-    """
-    data = request.get_json()
-    if not data or 'text' not in data:
-        return jsonify({'error': '请提供文本内容', 'required_field': 'text'}), 400
-    
-    text = data['text']
-    top_n = data.get('top_n', KEYWORD_TOP_N)
-    
-    keywords = extract_keywords(text, top_n=top_n)
-    
-    return jsonify({
-        'success': True,
-        'keywords': keywords,
-        'keyword_count': len(keywords),
-        'text_length': len(text)
+        'timestamp': datetime.now().isoformat(),
+        'backend': 'onnxruntime'
     })
 
 
@@ -691,18 +713,17 @@ def get_stats():
     return jsonify({
         'predictions_count': _prediction_count,
         'memory_usage_mb': memory_mb,
-        'model_loaded': _model is not None,
+        'model_loaded': _session is not None,
         'categories': _categories,
+        'backend': 'onnxruntime',
         'keyword_config': {
             'top_n': KEYWORD_TOP_N,
-            'min_n': KEYWORD_MIN_N,
-            'weighted': KEYWORD_WEIGHTED
+            'min_n': KEYWORD_MIN_N
         },
         'timestamp': datetime.now().isoformat()
     })
 
 
-# ---------- 错误处理 ----------
 @app.errorhandler(404)
 def not_found(error):
     return jsonify({'error': '接口不存在'}), 404
@@ -718,13 +739,20 @@ def main():
     global _prediction_count
     _prediction_count = 0
     
-    # 加载模型
     print("="*50)
-    print("PPTX学科分类器 API服务启动（带关键词提取）")
+    print("PPTX学科分类器 API服务启动 - 本地路径版本")
     print("="*50)
-    load_models()
     
-    # 获取端口配置
+    try:
+        load_models()
+    except Exception as e:
+        print(f"\n❌ 错误: 模型加载失败 - {e}")
+        print("\n请确保以下文件存在于当前目录:")
+        for f in [ONNX_MODEL_PATH, TEXT_TOKENIZER_PATH, FILENAME_TOKENIZER_PATH, CATEGORIES_PATH, CONFIG_PATH]:
+            exists = "✓" if Path(f).exists() else "✗"
+            print(f"  {exists} {f}")
+        sys.exit(1)
+    
     port = int(os.environ.get('PORT', 5000))
     host = os.environ.get('HOST', '0.0.0.0')
     debug = os.environ.get('DEBUG', 'False').lower() == 'true'
@@ -732,22 +760,17 @@ def main():
     print(f"\n服务启动信息:")
     print(f"  地址: http://{host}:{port}")
     print(f"  调试模式: {debug}")
+    print(f"  推理后端: ONNX Runtime")
     print(f"\n可用接口:")
+    print("  POST /predict          - 单文件预测（JSON: {\"filepath\": \"路径\"}）")
+    print(f"  POST /predict/batch    - 批量预测（JSON: {{\"filepaths\": [\"路径1\", \"路径2\"]}}）")
     print(f"  GET  /health           - 健康检查")
     print(f"  GET  /categories       - 获取类别列表")
     print(f"  GET  /stats            - 获取统计信息")
-    print(f"  POST /predict          - 单文件预测（含关键词）")
-    print(f"  POST /predict/batch    - 批量预测（含关键词）")
-    print(f"  POST /predict/url      - URL预测（含关键词）")
-    print(f"  POST /keywords/extract - 仅提取关键词")
     print("="*50)
     
     app.run(host=host, port=port, debug=debug, threaded=True)
 
 
 if __name__ == "__main__":
-    # 确保有意义的单字词定义
-    MEANINGFUL_SINGLE_CHARS = {'圆', '力', '氧', '氢', '碳', '钠', '酸', '碱', '盐', 
-                               '电', '光', '声', '热', '诗', '词', '歌', '曲', '数',
-                               '方', '程', '函', '数', '角', '形', '体', '积'}
     main()

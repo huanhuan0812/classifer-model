@@ -3,6 +3,7 @@
 """
 PPTX学科分类器预测脚本 - ONNX版本（零缓存，无Keras依赖）
 支持7类别：语文、数学、英语、物理、化学、生物、班会
+支持文件格式：.pptx, .ppt, .docx
 使用ONNX Runtime进行推理，内存占用更小，速度更快
 """
 
@@ -14,8 +15,11 @@ import re
 import pickle
 import argparse
 import logging
+import zipfile
+import tempfile
 from pathlib import Path
 from datetime import datetime
+from io import BytesIO
 
 # 屏蔽TensorFlow和Keras相关警告（如果有）
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -31,6 +35,14 @@ import numpy as np
 import onnxruntime as ort
 import jieba
 from pptx import Presentation
+
+# 尝试导入docx处理库
+try:
+    from docx import Document
+    DOCX_SUPPORT = True
+except ImportError:
+    DOCX_SUPPORT = False
+    print("警告: python-docx未安装，docx文件支持将受限。请运行: pip install python-docx")
 
 # ---------- 配置 ----------
 ONNX_MODEL_PATH = "textcnn_classifier.onnx"
@@ -271,14 +283,144 @@ def load_models():
     print()
 
 
-# ---------- PPTX 文本提取 ----------
-def extract_text_from_pptx(pptx_path):
-    """从PPTX文件中提取所有文本内容"""
+# ---------- DOCX 文本提取 ----------
+def extract_text_from_docx(docx_path):
+    """从DOCX文件中提取所有文本内容"""
+    text_chunks = []
+    total_text = ""
+    doc = None
+    
+    if not DOCX_SUPPORT:
+        print("  ⚠ 警告: python-docx未安装，无法解析docx文件")
+        return ""
+    
+    try:
+        doc = Document(docx_path)
+        
+        # 提取段落文本
+        for paragraph in doc.paragraphs:
+            if paragraph.text and paragraph.text.strip():
+                text_chunks.append(paragraph.text.strip())
+                if len(text_chunks) >= 20:
+                    total_text += " ".join(text_chunks) + " "
+                    text_chunks.clear()
+        
+        # 提取表格中的文本
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    if cell.text and cell.text.strip():
+                        text_chunks.append(cell.text.strip())
+                        if len(text_chunks) >= 20:
+                            total_text += " ".join(text_chunks) + " "
+                            text_chunks.clear()
+        
+        # 提取页眉页脚
+        if hasattr(doc, 'sections'):
+            for section in doc.sections:
+                # 页眉
+                if section.header and section.header.paragraphs:
+                    for para in section.header.paragraphs:
+                        if para.text and para.text.strip():
+                            text_chunks.append(para.text.strip())
+                # 页脚
+                if section.footer and section.footer.paragraphs:
+                    for para in section.footer.paragraphs:
+                        if para.text and para.text.strip():
+                            text_chunks.append(para.text.strip())
+        
+        # 添加剩余的文本块
+        if text_chunks:
+            total_text += " ".join(text_chunks)
+            text_chunks.clear()
+        
+    except Exception as e:
+        total_text = ""
+    finally:
+        if doc is not None:
+            del doc
+        text_chunks.clear()
+        del text_chunks
+        gc.collect()
+    
+    return total_text
+
+
+# ---------- PPTX 嵌入DOCX提取 ----------
+def extract_embedded_docx_from_pptx(pptx_path):
+    """从PPTX文件中提取嵌入的DOCX文件并读取其内容"""
+    embedded_texts = []
+    
+    try:
+        # PPTX文件本质上是ZIP压缩包
+        with zipfile.ZipFile(pptx_path, 'r') as zf:
+            # 查找嵌入的对象
+            # 嵌入的文件通常在 ppt/embeddings/ 目录下
+            for file_info in zf.filelist:
+                if file_info.filename.startswith('ppt/embeddings/') and file_info.filename.endswith(('.docx', '.doc')):
+                    try:
+                        # 读取嵌入的docx文件内容
+                        docx_data = zf.read(file_info.filename)
+                        
+                        # 使用临时文件或内存流处理docx
+                        if DOCX_SUPPORT:
+                            docx_stream = BytesIO(docx_data)
+                            doc = Document(docx_stream)
+                            
+                            # 提取文本
+                            for paragraph in doc.paragraphs:
+                                if paragraph.text and paragraph.text.strip():
+                                    embedded_texts.append(paragraph.text.strip())
+                            
+                            # 提取表格文本
+                            for table in doc.tables:
+                                for row in table.rows:
+                                    for cell in row.cells:
+                                        if cell.text and cell.text.strip():
+                                            embedded_texts.append(cell.text.strip())
+                            
+                            del doc
+                        else:
+                            # 尝试简单提取（仅当python-docx不可用时）
+                            # 简单方法：将docx作为zip读取，提取document.xml中的文本
+                            try:
+                                docx_zip = zipfile.ZipFile(BytesIO(docx_data))
+                                if 'word/document.xml' in docx_zip.namelist():
+                                    xml_content = docx_zip.read('word/document.xml').decode('utf-8', errors='ignore')
+                                    # 简单正则提取文本
+                                    text_matches = re.findall(r'>([^<]+)<', xml_content)
+                                    for match in text_matches:
+                                        if match.strip() and len(match.strip()) > 1:
+                                            embedded_texts.append(match.strip())
+                                docx_zip.close()
+                            except:
+                                pass
+                        
+                    except Exception as e:
+                        # 忽略单个嵌入文件的解析错误
+                        pass
+    
+    except Exception as e:
+        pass
+    
+    return " ".join(embedded_texts) if embedded_texts else ""
+
+
+# ---------- PPTX 文本提取（增强版，支持嵌入DOCX）----------
+def extract_text_from_pptx(pptx_path, extract_embedded=True):
+    """从PPTX文件中提取所有文本内容，包括嵌入的DOCX文件"""
     text_chunks = []
     total_text = ""
     prs = None
+    embedded_text = ""
     
     try:
+        # 提取嵌入的docx文件内容
+        if extract_embedded:
+            embedded_text = extract_embedded_docx_from_pptx(pptx_path)
+            if embedded_text:
+                text_chunks.append(embedded_text)
+        
         prs = Presentation(pptx_path)
         
         for slide in prs.slides:
@@ -299,6 +441,7 @@ def extract_text_from_pptx(pptx_path):
                             total_text += " ".join(text_chunks) + " "
                             text_chunks.clear()
                     
+                    # 提取表格中的文本
                     if hasattr(shape, "table"):
                         for row in shape.table.rows:
                             for cell in row.cells:
@@ -307,6 +450,12 @@ def extract_text_from_pptx(pptx_path):
                                     if len(text_chunks) >= 10:
                                         total_text += " ".join(text_chunks) + " "
                                         text_chunks.clear()
+                    
+                    # 检查是否为嵌入的对象（备用方法）
+                    if hasattr(shape, "has_text_frame") and shape.has_text_frame:
+                        if shape.text_frame.text and shape.text_frame.text.strip():
+                            text_chunks.append(shape.text_frame.text.strip())
+                            
                 except:
                     continue
             
@@ -337,6 +486,20 @@ def extract_text_from_pptx(pptx_path):
         gc.collect()
     
     return total_text
+
+
+# ---------- 统一文件处理入口 ----------
+def extract_text_from_file(filepath):
+    """根据文件类型提取文本内容"""
+    filepath = Path(filepath)
+    suffix = filepath.suffix.lower()
+    
+    if suffix in ['.pptx', '.ppt']:
+        return extract_text_from_pptx(str(filepath))
+    elif suffix == '.docx':
+        return extract_text_from_docx(str(filepath))
+    else:
+        return ""
 
 
 # ---------- 文本预处理 ----------
@@ -432,9 +595,9 @@ def pad_sequences(sequences, maxlen, padding='post', truncating='post'):
     return result
 
 
-# ---------- 核心预测函数 ----------
-def predict_pptx(filepath, verbose=True):
-    """预测单个PPTX文件"""
+# ---------- 核心预测函数（支持多种文件类型）----------
+def predict_file(filepath, verbose=True):
+    """预测单个文件（支持PPTX、PPT、DOCX）"""
     global _text_tokenizer, _filename_tokenizer, _categories, _config
     
     if _text_tokenizer is None:
@@ -446,12 +609,22 @@ def predict_pptx(filepath, verbose=True):
     if not filepath.exists():
         raise FileNotFoundError(f"文件不存在: {filepath}")
     
-    if filepath.suffix.lower() not in ['.pptx', '.ppt']:
-        raise ValueError(f"不支持的文件格式: {filepath.suffix}")
+    suffix = filepath.suffix.lower()
+    if suffix not in ['.pptx', '.ppt', '.docx']:
+        raise ValueError(f"不支持的文件格式: {suffix}，仅支持 .pptx, .ppt, .docx")
     
     # 提取特征
     filename_feature = extract_filename_features(str(filepath))
-    raw_text = extract_text_from_pptx(str(filepath))
+    raw_text = extract_text_from_file(str(filepath))
+    
+    # 标记是否从嵌入docx中提取了内容
+    embedded_used = False
+    if suffix in ['.pptx', '.ppt'] and not raw_text.strip():
+        # 如果PPTX本身没有文本，尝试更深入地提取嵌入docx
+        embedded_text = extract_embedded_docx_from_pptx(str(filepath))
+        if embedded_text:
+            raw_text = embedded_text
+            embedded_used = True
     
     if raw_text:
         cleaned = clean_text(raw_text)
@@ -524,9 +697,12 @@ def predict_pptx(filepath, verbose=True):
         
         print(f"\n{'='*50}")
         print(f"文件: {filepath.name}")
+        print(f"类型: {suffix.upper()}")
         print(f"{'='*50}")
         print(f"📝 文本长度: {text_len} 词")
         print(f"📝 文本可用: {'是' if text_available else '否'}")
+        if embedded_used:
+            print(f"📎 来源: 从PPTX嵌入的DOCX文件中提取")
         print(f"\n🎯 预测结果: {predicted_class}")
         print(f"📊 置信度: {confidence:.2%}")
         print(f"\n📈 详细分类概率:")
@@ -537,22 +713,37 @@ def predict_pptx(filepath, verbose=True):
         
         del all_probs, sorted_probs
     else:
-        print(f"{filepath.name}: {predicted_class} ({confidence:.2%})")
+        source_info = " (from embedded)" if embedded_used else ""
+        print(f"{filepath.name}{source_info}: {predicted_class} ({confidence:.2%})")
     
     del predictions
     gc.collect()
     
     return predicted_class, confidence, {
         'text_length': text_len,
-        'text_available': text_available
+        'text_available': text_available,
+        'embedded_used': embedded_used,
+        'file_type': suffix
     }
+
+
+# 保持向后兼容
+def predict_pptx(filepath, verbose=True):
+    """预测单个PPTX文件（向后兼容）"""
+    return predict_file(filepath, verbose)
 
 
 # ---------- 交互式预测 ----------
 def interactive_mode():
     """交互式预测模式"""
     print("\n" + "="*50)
-    print("PPTX学科分类器 - 交互式预测模式")
+    print("文件分类器 - 交互式预测模式")
+    print("支持格式: PPTX, PPT, DOCX")
+    if DOCX_SUPPORT:
+        print("✅ python-docx已安装，支持完整DOCX解析")
+    else:
+        print("⚠️ python-docx未安装，DOCX支持受限（仅简单文本提取）")
+    print("="*50)
     
     # 显示词表信息
     text_info = _text_tokenizer.get_vocab_info()
@@ -563,7 +754,7 @@ def interactive_mode():
     print(f"模型词汇表限制: {MODEL_VOCAB_SIZE} (有效索引: 1-{MODEL_VOCAB_SIZE-1})")
     print(f"OOV Token: {text_info['oov_token']}")
     print("="*50)
-    print("输入PPTX文件路径进行预测，输入 'quit' 或 'exit' 退出")
+    print("输入文件路径进行预测（.pptx, .ppt, .docx），输入 'quit' 或 'exit' 退出")
     print("-"*50)
     
     while True:
@@ -584,8 +775,13 @@ def interactive_mode():
             print(f"错误: 文件不存在 '{filepath}'")
             continue
         
+        suffix = Path(filepath).suffix.lower()
+        if suffix not in ['.pptx', '.ppt', '.docx']:
+            print(f"错误: 不支持的文件格式 '{suffix}'，请使用 .pptx, .ppt 或 .docx 文件")
+            continue
+        
         try:
-            predict_pptx(filepath, verbose=True)
+            predict_file(filepath, verbose=True)
             gc.collect()
         except Exception as e:
             print(f"预测失败: {e}")
@@ -593,26 +789,32 @@ def interactive_mode():
             traceback.print_exc()
 
 
-# ---------- 批量预测 ----------
+# ---------- 批量预测（支持多种文件类型）----------
 def predict_batch(directory_path, recursive=False):
-    """批量预测"""
+    """批量预测，支持PPTX和DOCX文件"""
     directory = Path(directory_path)
     
     if not directory.exists():
         raise FileNotFoundError(f"目录不存在: {directory}")
     
+    # 查找所有支持的文件
+    supported_extensions = ['*.pptx', '*.PPTX', '*.ppt', '*.PPT', '*.docx', '*.DOCX']
+    pptx_files = []
+    
     if recursive:
-        pptx_files = list(directory.rglob("*.pptx")) + list(directory.rglob("*.PPTX"))
+        for ext in supported_extensions:
+            pptx_files.extend(directory.rglob(ext))
     else:
-        pptx_files = list(directory.glob("*.pptx")) + list(directory.glob("*.PPTX"))
+        for ext in supported_extensions:
+            pptx_files.extend(directory.glob(ext))
     
     pptx_files = list(set(pptx_files))
     
     if not pptx_files:
-        print(f"未找到PPTX文件: {directory}")
+        print(f"未找到支持的文件（.pptx, .ppt, .docx）: {directory}")
         return
     
-    print(f"\n找到 {len(pptx_files)} 个PPTX文件，开始批量预测...")
+    print(f"\n找到 {len(pptx_files)} 个文件，开始批量预测...")
     print("="*60)
     
     output_csv = directory / f"prediction_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
@@ -620,32 +822,42 @@ def predict_batch(directory_path, recursive=False):
     
     success_count = 0
     class_counts = {}
+    type_counts = {}
     
     with open(output_csv, 'w', newline='', encoding='utf-8-sig') as f:
-        writer = csv.DictWriter(f, fieldnames=['file', 'predicted_class', 'confidence'])
+        writer = csv.DictWriter(f, fieldnames=['file', 'file_type', 'predicted_class', 'confidence', 'text_available', 'embedded_used'])
         writer.writeheader()
         
         for i, filepath in enumerate(pptx_files, 1):
+            suffix = filepath.suffix.lower()
             print(f"\n[{i}/{len(pptx_files)}] 处理中: {filepath.name[:50]}", end=' ')
             sys.stdout.flush()
             
             try:
-                pred_class, confidence, _ = predict_pptx(str(filepath), verbose=False)
+                pred_class, confidence, info = predict_file(str(filepath), verbose=False)
                 writer.writerow({
                     'file': str(filepath),
+                    'file_type': suffix,
                     'predicted_class': pred_class,
-                    'confidence': f"{confidence:.4f}"
+                    'confidence': f"{confidence:.4f}",
+                    'text_available': str(info.get('text_available', False)),
+                    'embedded_used': str(info.get('embedded_used', False))
                 })
                 f.flush()
                 success_count += 1
                 class_counts[pred_class] = class_counts.get(pred_class, 0) + 1
-                print(f"✓ → {pred_class} ({confidence:.1%})")
+                type_counts[suffix] = type_counts.get(suffix, 0) + 1
+                source_info = " [embedded]" if info.get('embedded_used') else ""
+                print(f"✓ → {pred_class} ({confidence:.1%}){source_info}")
             except Exception as e:
                 print(f"✗ → 错误: {str(e)[:50]}")
                 writer.writerow({
                     'file': str(filepath),
+                    'file_type': suffix,
                     'predicted_class': 'ERROR',
-                    'confidence': '0'
+                    'confidence': '0',
+                    'text_available': 'False',
+                    'embedded_used': 'False'
                 })
                 f.flush()
             
@@ -657,6 +869,11 @@ def predict_batch(directory_path, recursive=False):
     print(f"总计: {len(pptx_files)} 个文件")
     print(f"成功: {success_count} 个")
     print(f"失败: {len(pptx_files) - success_count} 个")
+    
+    if type_counts:
+        print("\n文件类型分布:")
+        for ftype, count in sorted(type_counts.items(), key=lambda x: x[1], reverse=True):
+            print(f"  {ftype}: {count} 个")
     
     if class_counts:
         print("\n类别分布:")
@@ -671,6 +888,7 @@ def predict_batch(directory_path, recursive=False):
 def main():
     print("正在初始化ONNX推理引擎...")
     print(f"模型词汇表限制: {MODEL_VOCAB_SIZE} (有效索引: 1-{MODEL_VOCAB_SIZE-1})")
+    print(f"DOCX支持: {'✅ 已启用' if DOCX_SUPPORT else '❌ 未安装python-docx'}")
     print("-" * 40)
     
     try:
@@ -683,8 +901,8 @@ def main():
             print(f"  {exists} {f}")
         return 1
     
-    parser = argparse.ArgumentParser(description='PPTX学科分类器预测工具（ONNX版本）')
-    parser.add_argument('input', nargs='?', help='PPTX文件路径或目录路径')
+    parser = argparse.ArgumentParser(description='文件分类器预测工具（支持PPTX、PPT、DOCX）')
+    parser.add_argument('input', nargs='?', help='文件路径或目录路径（支持.pptx, .ppt, .docx）')
     parser.add_argument('--batch', '-b', action='store_true', help='批量预测模式')
     parser.add_argument('--recursive', '-r', action='store_true', help='递归搜索子目录')
     parser.add_argument('--interactive', '-i', action='store_true', help='交互式预测模式')
@@ -698,7 +916,7 @@ def main():
             input_path = args.input or "."
             predict_batch(input_path, recursive=args.recursive)
         elif args.input:
-            predict_pptx(args.input, verbose=True)
+            predict_file(args.input, verbose=True)
         else:
             parser.print_help()
     except KeyboardInterrupt:

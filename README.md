@@ -1,355 +1,242 @@
-# PPTX 学科分类器 - 使用文档
+# 📘 文件学科分类器训练脚本使用文档（TextCNN 优化版）
 
-## 项目简介
+## 1. 概述
 
-这是一个基于 TextCNN 的多模态深度学习模型，用于自动分类 PPTX 文件所属的学科类别。系统同时分析**PPT文本内容**（权重70%）和**文件名**（权重30%），支持以下7个类别：
+本脚本用于训练一个基于 **TextCNN** 的多模态分类模型，支持以下学科类别：
 
-- 语文、数学、英语、物理、化学、生物、班会
+- 语文
+- 数学
+- 英语
+- 物理
+- 化学
+- 生物
+- 班会
 
-## 文件说明
+支持的文件格式：
 
-| 文件 | 功能 |
-|------|------|
-| `classifer.py` | 模型训练脚本 |
-| `predict.py` | 命令行预测工具 |
-| `server-api.py` | RESTful API 服务 |
+- `.pptx` / `.ppt`（PowerPoint）
+- `.docx`（Word）
 
----
+核心特性：
 
-## 第一部分：环境配置
-
-### 1.1 安装依赖
-
-```bash
-pip install tensorflow python-pptx jieba scikit-learn numpy flask flask-cors psutil
-```
-
-### 1.2 目录结构
-
-```
-项目目录/
-├── classifer.py          # 训练脚本
-├── predict.py            # 预测工具
-├── server-api.py         # API服务
-├── ../data/              # 训练数据目录（与脚本同级或按配置）
-│   ├── 语文/             # 放入语文PPTX文件
-│   ├── 数学/             # 放入数学PPTX文件
-│   ├── 英语/             # 放入英语PPTX文件
-│   ├── 物理/             # 放入物理PPTX文件
-│   ├── 化学/             # 放入化学PPTX文件
-│   ├── 生物/             # 放入生物PPTX文件
-│   └── 班会/             # 放入班会PPTX文件
-└── 输出文件/             # 训练后生成的模型文件
-```
+- 文本内容权重 70%，文件名权重 30%
+- 文件名数据增强
+- 多尺度卷积（kernel size = 2,3,4,5）
+- 文件解析缓存（避免重复解析）
+- 类别权重处理（缓解类别不平衡）
+- 支持指定科目仅使用缓存（跳过解析）
+- 自动去除人名（基于 jieba 词性标注）
+- 词表截断（限制在 20000 词以内）
+- 输出 JSON 格式词表，便于外部工具使用
 
 ---
 
-## 第二部分：模型训练 (`classifer.py`)
+## 2. 环境准备
 
-### 2.1 基本使用
+### 2.1 安装依赖
 
-```bash
-python classifer.py
-```
-
-### 2.2 核心配置参数（修改脚本开头的配置区）
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `DATA_ROOT` | `"../data"` | 训练数据目录 |
-| `TEXT_WEIGHT` | `0.70` | 文本内容权重 |
-| `FILENAME_WEIGHT` | `0.30` | 文件名权重 |
-| `ENABLE_FILENAME_AUGMENTATION` | `True` | 是否启用文件名数据增强 |
-| `MAX_SEQUENCE_LENGTH` | `750` | 文本最大长度 |
-| `BATCH_SIZE` | `16` | 批次大小 |
-| `EPOCHS` | `32` | 训练轮数 |
-| `ENABLE_CROSS_VALIDATION` | `False` | 是否启用交叉验证 |
-
-### 2.3 输出文件
-
-训练完成后生成以下文件：
-
-| 文件 | 用途 |
-|------|------|
-| `textcnn_balanced_classifier.keras` | 最终模型 |
-| `best_model_balanced.keras` | 最佳模型（验证集最优） |
-| `text_tokenizer.pkl` | 文本分词器 |
-| `filename_tokenizer.pkl` | 文件名词典 |
-| `categories.pkl` | 类别映射 |
-| `config_balanced.pkl` | 模型配置 |
-
-### 2.4 训练数据要求
-
-- 每个类别目录下放置对应的 `.pptx` 文件
-- 建议每个类别至少 **30-50** 个文件以保证效果
-- 文件名和文本内容越有学科特征，效果越好
-
----
-
-## 第三部分：命令行预测 (`predict.py`)
-
-### 3.1 单文件预测
+推荐使用 `conda` 或 `pip` 安装以下依赖：
 
 ```bash
-python predict.py /path/to/your/file.pptx
+pip install numpy tensorflow scikit-learn python-pptx jieba python-docx matplotlib
 ```
 
-输出示例：
-```
-==================================================
-文件: 三角函数复习.pptx
-==================================================
-📄 文件名: 三角函数 复习
-📝 文本长度: 1250 词
+### 2.2 验证依赖
 
-🎯 预测结果: 数学
-📊 置信度: 94.32%
-
-📈 详细分类概率:
-   数学: 94.32% ██████████████████████████
-   物理:  3.12% ███
-   化学:  1.56% ██
-```
-
-### 3.2 批量预测目录
-
-```bash
-# 预测目录下所有PPTX
-python predict.py /path/to/directory --batch
-
-# 递归搜索子目录
-python predict.py /path/to/directory --batch --recursive
-```
-
-### 3.3 交互式模式
-
-```bash
-python predict.py --interactive
-```
-
-进入交互模式后：
-- 直接输入文件路径进行预测
-- 输入 `quit` 退出
-- 输入 `mem` 查看内存使用（需安装psutil）
-
-### 3.4 命令行参数说明
-
-| 参数 | 简写 | 说明 |
-|------|------|------|
-| `input` | - | PPTX文件路径或目录路径 |
-| `--batch` | `-b` | 启用批量预测模式 |
-| `--recursive` | `-r` | 递归搜索子目录 |
-| `--interactive` | `-i` | 启用交互式模式 |
-
----
-
-## 第四部分：API 服务 (`server-api.py`)
-
-### 4.1 启动服务
-
-```bash
-python server-api.py
-```
-
-可配置环境变量：
-```bash
-PORT=8080 python server-api.py          # 指定端口
-HOST=127.0.0.1 python server-api.py     # 指定主机
-DEBUG=true python server-api.py          # 开启调试模式
-```
-
-### 4.2 API 接口列表
-
-#### 4.2.1 健康检查
-```http
-GET /health
-```
-响应：
-```json
-{
-  "status": "healthy",
-  "model_loaded": true,
-  "categories": ["语文", "数学", "英语", "物理", "化学", "生物", "班会"],
-  "timestamp": "2026-01-15T10:30:00"
-}
-```
-
-#### 4.2.2 单文件预测（含关键词）
-```http
-POST /predict
-Content-Type: multipart/form-data
-
-file: <PPTX文件>
-```
-响应：
-```json
-{
-  "success": true,
-  "filename": "三角函数复习.pptx",
-  "predicted_class": "数学",
-  "confidence": 0.9432,
-  "keywords": ["三角函数", "正弦", "余弦", "公式", "角度"],
-  "filename_keywords": ["三角函数", "复习"],
-  "text_length": 1250,
-  "top_3": [
-    ["数学", 0.9432],
-    ["物理", 0.0312],
-    ["化学", 0.0156]
-  ]
-}
-```
-
-#### 4.2.3 批量预测
-```http
-POST /predict/batch
-Content-Type: multipart/form-data
-
-files: <多个PPTX文件>
-```
-响应：包含每个文件的预测结果和汇总统计
-
-#### 4.2.4 URL 预测
-```http
-POST /predict/url
-Content-Type: application/json
-
-{
-  "url": "https://example.com/file.pptx"
-}
-```
-
-#### 4.2.5 仅提取关键词（不预测）
-```http
-POST /keywords/extract
-Content-Type: application/json
-
-{
-  "text": "这里是PPTX中提取的文本内容...",
-  "top_n": 10
-}
-```
-
-#### 4.2.6 获取类别列表
-```http
-GET /categories
-```
-
-#### 4.2.7 获取服务统计
-```http
-GET /stats
-```
-
-### 4.3 cURL 调用示例
-
-```bash
-# 单文件预测
-curl -X POST -F "file=@/path/to/file.pptx" http://localhost:5000/predict
-
-# 批量预测
-curl -X POST -F "files=@file1.pptx" -F "files=@file2.pptx" http://localhost:5000/predict/batch
-
-# URL预测
-curl -X POST -H "Content-Type: application/json" \
-  -d '{"url":"https://example.com/file.pptx"}' \
-  http://localhost:5000/predict/url
-```
-
----
-
-## 第五部分：注意事项
-
-### 5.1 环境要求
-
-| 依赖 | 推荐版本 | 说明 |
-|------|----------|------|
-| Python | 3.8 - 3.10 | TensorFlow 2.13+ 对 3.11+ 支持不完善 |
-| TensorFlow | 2.13.0 | 使用 `compile=False` 加载模型 |
-| 内存 | 2GB+ | 模型加载和预测需要 |
-| 磁盘 | 100MB | 存储模型文件（约40MB） |
-
-### 5.2 常见问题
-
-#### Q1: 模型加载失败？
-确保以下文件存在于当前目录：
-- `textcnn_balanced_classifier.keras`
-- `text_tokenizer.pkl`
-- `filename_tokenizer.pkl`
-- `categories.pkl`
-- `config_balanced.pkl`
-
-#### Q2: 中文分词问题？
-脚本已集成 jieba 分词，首次运行会自动下载词典。如遇分词异常：
 ```python
-jieba.set_dictionary('path/to/custom/dict.txt')  # 使用自定义词典
-```
-
-#### Q3: 内存持续增长？
-脚本已针对交互式使用优化：
-- 每5次预测后自动执行 `gc.collect()`
-- 批量预测每10个文件清理一次内存
-- API服务使用临时文件，预测后自动删除
-
-#### Q4: 预测准确率低？
-- 增加训练样本数量（每个类别建议50+）
-- 调整 `TEXT_WEIGHT` 和 `FILENAME_WEIGHT` 权重
-- 启用文件名数据增强（`ENABLE_FILENAME_AUGMENTATION = True`）
-- 启用交叉验证评估泛化能力（`ENABLE_CROSS_VALIDATION = True`）
-
-#### Q5: GPU 支持？
-- GPU 会自动使用，无需特殊配置
-- 可通过 `CUDA_VISIBLE_DEVICES=""` 禁用 GPU
-
-#### Q6: 不支持 .ppt 格式？
-脚本主要支持 `.pptx` 格式。对于旧版 `.ppt` 格式，建议先转换为 `.pptx`。
-
-### 5.3 性能建议
-
-| 场景 | 建议 |
-|------|------|
-| 单次预测 | 直接使用 `predict.py` |
-| 批量预测 | 使用 `predict.py --batch` |
-| Web服务 | 使用 `server-api.py`，配置 `threaded=True` |
-| 高频调用 | 保持模型常驻内存，重复使用 `predict_pptx_internal` |
-
-### 5.4 安全注意事项
-
-- API 服务默认监听 `0.0.0.0:5000`，生产环境建议：
-  - 使用反向代理（Nginx）
-  - 添加认证机制
-  - 限制文件大小（建议 < 50MB）
-- 临时文件自动清理，但高并发下需注意磁盘空间
-
----
-
-## 第六部分：扩展开发
-
-### 6.1 添加新类别
-
-1. 修改 `classifer.py` 中的 `CATEGORIES` 列表
-2. 在 `data/` 目录下创建对应文件夹
-3. 放入训练文件，重新训练
-
-### 6.2 调整权重
-
-修改 `classifer.py` 中的：
-```python
-TEXT_WEIGHT = 0.70      # 文本权重
-FILENAME_WEIGHT = 0.30  # 文件名权重
-```
-
-### 6.3 自定义停用词
-
-修改脚本中的 `STOPWORDS` 集合：
-```python
-STOPWORDS = set(['的', '了', '是', ...])  # 添加自定义停用词
+import pptx
+import docx
+import jieba
+print("所有依赖已安装")
 ```
 
 ---
 
-## 联系方式
+## 3. 数据准备
 
-如有问题，请检查：
-1. 所有依赖是否正确安装
-2. 模型文件是否完整
-3. 数据目录结构是否正确
-4. Python 版本是否为 3.8-3.10
+### 3.1 目录结构
+
+```text
+../data/
+├── 语文/
+│   ├── 1.pptx
+│   ├── 2.docx
+│   └── ...
+├── 数学/
+├── 英语/
+├── 物理/
+├── 化学/
+├── 生物/
+└── 班会/
+```
+
+### 3.2 文件命名建议
+
+- 可使用中文、英文、数字组合
+- 脚本会自动提取文件名作为辅助特征
+- 支持数据增强（如去除数字、仅保留中文等）
+
+---
+
+## 4. 配置说明
+
+脚本中所有关键参数均在 **“优化后的配置参数”** 部分定义，常用配置如下：
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `DATA_ROOT` | 数据目录路径 | `"../data"` |
+| `CACHE_DIR` | 缓存目录 | `"../cache"` |
+| `CATEGORIES` | 分类类别列表 | 7 个学科 |
+| `SKIP_CATEGORIES` | 仅使用缓存的科目 | `[]` |
+| `MAX_NB_WORDS` | 最大词表大小 | 20000 |
+| `MAX_SEQUENCE_LENGTH` | 文本最大长度 | 1000 |
+| `EMBEDDING_DIM` | 文本向量维度 | 150 |
+| `TEXT_WEIGHT` / `FILENAME_WEIGHT` | 权重比例 | 0.7 / 0.3 |
+| `ENABLE_CACHE` | 是否启用缓存 | `True` |
+| `REMOVE_PERSON_NAMES` | 是否去除人名 | `True` |
+| `USE_CLASS_WEIGHTS` | 是否使用类别权重 | `True` |
+| `EPOCHS` | 训练轮数 | 40 |
+| `BATCH_SIZE` | 批量大小 | 12 |
+
+---
+
+## 5. 运行训练
+
+### 5.1 基本运行
+
+```bash
+python train.py
+```
+
+### 5.2 强制刷新缓存
+
+```python
+FORCE_REFRESH_CACHE = True
+```
+
+### 5.3 指定科目仅使用缓存
+
+```python
+SKIP_CATEGORIES = ["语文", "数学"]
+```
+
+> 注意：这些科目的文件必须已存在于缓存中，否则将被跳过。
+
+---
+
+## 6. 训练流程说明
+
+1. **加载文件**  
+   - 扫描 `DATA_ROOT` 下的所有文件
+   - 使用缓存加速解析（支持 `.pptx`, `.ppt`, `.docx`）
+   - 自动去除人名（基于 jieba 词性标注）
+
+2. **数据增强**  
+   - 对文件名生成多种变体（去数字、仅中文等）
+
+3. **数据集划分**  
+   - 训练集（70%）、验证集（15%）、测试集（15%）
+
+4. **构建词表**  
+   - 使用 `Tokenizer` 构建文本和文件名词表
+   - 截断到 `MAX_NB_WORDS` 和 `MAX_FILENAME_WORDS`
+
+5. **模型构建**  
+   - 文本分支：多尺度 CNN + GlobalMaxPooling
+   - 文件名分支：CNN + GlobalMaxPooling
+   - 融合后输出分类
+
+6. **训练**  
+   - 使用 EarlyStopping、ModelCheckpoint、ReduceLROnPlateau 回调
+
+7. **评估 & 保存**  
+   - 输出分类报告、混淆矩阵
+   - 保存模型、Tokenizer、JSON 词表等
+
+---
+
+## 7. 输出文件说明
+
+训练完成后，脚本会在当前目录生成以下文件：
+
+| 文件名 | 说明 |
+|--------|------|
+| `textcnn_optimized_classifier.keras` | 完整训练好的 Keras 模型 |
+| `best_model_optimized.keras` | 验证集最佳模型 |
+| `text_tokenizer.pkl` | 文本 Tokenizer（完整） |
+| `filename_tokenizer.pkl` | 文件名 Tokenizer（完整） |
+| `text_tokenizer_none.pkl` | 无依赖 Tokenizer（截断） |
+| `filename_tokenizer_none.pkl` | 无依赖 Tokenizer（截断） |
+| `categories.pkl` | 类别列表 |
+| `config_optimized.pkl` | 训练配置 |
+| `text_vocabulary.json` | 文本词表（JSON） |
+| `filename_vocabulary.json` | 文件名词表（JSON） |
+| `category_mapping.json` | 类别映射 |
+| `word_frequency_report.json` | 词频统计报告 |
+| `training_history.png` | 训练曲线图 |
+| `../cache/file_cache_*.json` | 文件内容缓存 |
+| `../cache/name_removal_stats_*.json` | 人名去除统计 |
+
+---
+
+## 8. 常见问题
+
+### Q1：提示 `python-docx` 未安装
+
+```bash
+pip install python-docx
+```
+
+### Q2：缓存命中率低
+
+- 确保文件未被修改
+- 可设置 `FORCE_REFRESH_CACHE = True` 重建缓存
+
+### Q3：某些科目文件未被加载
+
+- 检查目录名是否与 `CATEGORIES` 完全一致
+- 检查文件扩展名是否在 `SUPPORTED_EXTENSIONS` 中
+
+### Q4：人名去除是否影响分类效果？
+
+- 去除常见人名（如“李明说”）有助于减少噪声
+- 如果效果不佳，可设置 `REMOVE_PERSON_NAMES = False`
+
+### Q5：如何只使用缓存不解析新文件？
+
+- 设置 `SKIP_CATEGORIES = ["语文", "数学"]` 等需要跳过的科目
+- 其他科目仍会解析并更新缓存
+
+---
+
+## 9. 示例命令（完整运行）
+
+```bash
+# 1. 准备数据
+mkdir -p ../data/语文 ../data/数学
+
+# 2. 放入文件
+cp example.pptx ../data/语文/
+cp example.docx ../data/数学/
+
+# 3. 运行训练
+python train.py
+```
+
+---
+
+## 10. 使用训练后的模型
+[使用预测](./predict.md)
+
+---
+
+## 11. 联系与扩展
+
+- 如需增加新类别，请修改 `CATEGORIES` 并确保目录存在
+- 如需调整文本/文件名权重，修改 `TEXT_WEIGHT` 和 `FILENAME_WEIGHT`
+- 模型推理脚本可基于保存的 Tokenizer 和模型构建
+
+---
+
+**版本**：v5  
+**最后更新**：2026-06-06

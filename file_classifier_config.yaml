@@ -1,0 +1,53 @@
+# file_classifier_config.yaml
+# 文件分类器配置文件
+
+# 路径配置
+paths:
+  source_dir: "./input"      # 源文件夹路径
+  target_base_dir: "./output" # 目标基础文件夹路径
+  # 注意：文件将移动到 target_base_dir/类别名/ 下
+
+# 预测配置
+prediction:
+  threshold: 0.98              # 置信度阈值，低于此值不移动文件
+  verbose: true               # 是否显示详细信息
+  supported_formats:          # 支持的文件格式
+    - ".pptx"
+    - ".docx"
+
+# 文件处理配置
+file_handling:
+  move_files: true            # true=移动文件, false=复制文件
+  create_category_dirs: true  # 是否自动创建类别目录
+  overwrite: false            # 是否覆盖已存在的文件
+  keep_original_name: true    # 是否保持原文件名
+  # 文件名冲突时的处理方式: "rename" 或 "skip"
+  conflict_resolution: "skip"
+
+# 分类配置
+categories:
+  # 定义需要处理的类别（空列表表示所有类别）
+  # 例如: ["语文", "数学", "英语"] 只处理这些类别
+  target_categories: []
+  
+  # 需要排除的类别
+  exclude_categories: []
+  
+  # 未达阈值的文件处理方式: "ignore" 或 "move_to_uncertain"
+  low_confidence_action: "ignore"
+  # 当 low_confidence_action 为 "move_to_uncertain" 时，不确定文件存放的文件夹名
+  uncertain_folder_name: "_uncertain_low_confidence"
+
+# 日志配置
+logging:
+  enabled: true               # 是否启用日志
+  log_file: "file_mover.log" # 日志文件路径
+  log_level: "INFO"          # DEBUG, INFO, WARNING, ERROR
+  save_moved_list: true       # 是否保存移动文件列表
+  moved_list_file: "moved_files.csv"
+
+# 高级选项
+advanced:
+  max_file_size_mb: 0       # 最大文件大小限制(MB)，0表示无限制
+  skip_empty_text: false      # 是否跳过无法提取文本的文件
+  recursive_scan: false        # 是否递归扫描子文件夹

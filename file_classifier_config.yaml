@@ -38,6 +38,24 @@ categories:
   # 当 low_confidence_action 为 "move_to_uncertain" 时，不确定文件存放的文件夹名
   uncertain_folder_name: "_uncertain_low_confidence"
 
+# 🆕 临时文件清理配置
+temp_file_cleanup:
+  enabled: false              # 是否启用临时文件清理
+  action: "delete"            # 清理动作: 'delete'(删除) 或 'move'(移动)
+  target_dir: "./temp_cleanup" # 移动模式下的目标目录
+  patterns:                   # 要清理的文件模式
+    - "~$*"                   # Office临时文件（~$开头）
+    - "*.tmp"                 # 临时文件
+    - "*~"                    # 备份文件
+    - "*.bak"                 # 备份文件
+    - "*.swp"                 # Vim临时文件
+    - "*.DS_Store"            # macOS系统文件
+  min_file_age_minutes: 0     # 最小文件年龄(分钟)，0=不限制
+  clean_on_start: true        # 处理前清理
+  clean_on_end: true          # 处理后清理
+  dry_run: false              # 试运行模式，不实际删除/移动
+  keep_empty_dirs: false      # 清理后是否保留空目录
+
 # 日志配置
 logging:
   enabled: true               # 是否启用日志
@@ -45,9 +63,12 @@ logging:
   log_level: "INFO"          # DEBUG, INFO, WARNING, ERROR
   save_moved_list: true       # 是否保存移动文件列表
   moved_list_file: "moved_files.csv"
+  save_cleanup_list: true     # 🆕 保存清理记录
+  cleanup_list_file: "cleaned_files.csv"  # 🆕 清理记录文件
 
 # 高级选项
 advanced:
   max_file_size_mb: 0       # 最大文件大小限制(MB)，0表示无限制
   skip_empty_text: false      # 是否跳过无法提取文本的文件
   recursive_scan: false        # 是否递归扫描子文件夹
+  skip_temp_files: true       # 跳过临时文件（~$开头、.tmp等）

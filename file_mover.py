@@ -4,6 +4,7 @@
 文件分类移动程序
 根据分类结果将PPTX、DOCX文件移动到对应的类别文件夹
 支持置信度阈值过滤
+支持临时文件清理
 """
 
 import os
@@ -64,6 +65,8 @@ class FileClassifierMover:
             'skipped_low_confidence': 0,
             'skipped_size_limit': 0,
             'skipped_empty_text': 0,
+            'skipped_temp_file': 0,  # 跳过的临时文件计数
+            'cleaned_temp_files': 0,  # 🆕 清理的临时文件计数
             'failed': 0,
             'already_exists': 0,
             'category_stats': {}
@@ -71,6 +74,9 @@ class FileClassifierMover:
         
         # 移动记录列表
         self.moved_records = []
+        
+        # 临时文件清理记录
+        self.cleaned_records = []
         
         # 初始化模型
         print("正在加载分类模型...")
@@ -121,17 +127,31 @@ class FileClassifierMover:
                 'low_confidence_action': 'move_to_uncertain',
                 'uncertain_folder_name': '_uncertain_low_confidence'
             },
+            'temp_file_cleanup': {  # 🆕 临时文件清理配置
+                'enabled': False,  # 是否启用清理
+                'action': 'delete',  # 清理动作: 'delete' 或 'move'
+                'target_dir': './temp_cleanup',  # 移动模式下的目标目录
+                'patterns': ['~$*', '*.tmp', '*~'],  # 要清理的文件模式
+                'min_file_age_minutes': 0,  # 最小文件年龄(分钟)，0表示不限制
+                'clean_on_start': True,  # 处理前清理
+                'clean_on_end': True,    # 处理后清理
+                'dry_run': False,        # 试运行模式，不实际删除/移动
+                'keep_empty_dirs': False  # 清理后是否保留空目录
+            },
             'logging': {
                 'enabled': True,
                 'log_file': 'file_mover.log',
                 'log_level': 'INFO',
                 'save_moved_list': True,
-                'moved_list_file': 'moved_files.csv'
+                'moved_list_file': 'moved_files.csv',
+                'save_cleanup_list': True,  # 🆕 保存清理记录
+                'cleanup_list_file': 'cleaned_files.csv'  # 🆕 清理记录文件
             },
             'advanced': {
                 'max_file_size_mb': 100,
                 'skip_empty_text': False,
-                'recursive_scan': True
+                'recursive_scan': True,
+                'skip_temp_files': True  # 是否跳过临时文件（不进行分类）
             }
         }
     
@@ -167,10 +187,237 @@ class FileClassifierMover:
         self.skip_empty_text = self.config['advanced']['skip_empty_text']
         self.low_confidence_action = self.config['categories']['low_confidence_action']
         self.uncertain_folder = self.config['categories']['uncertain_folder_name']
+        self.skip_temp_files = self.config['advanced'].get('skip_temp_files', True)
+        
+        # 🆕 临时文件清理配置
+        self.temp_cleanup_config = self.config.get('temp_file_cleanup', {})
+        self.cleanup_enabled = self.temp_cleanup_config.get('enabled', False)
+        self.cleanup_action = self.temp_cleanup_config.get('action', 'delete')
+        self.cleanup_target_dir = Path(self.temp_cleanup_config.get('target_dir', './temp_cleanup'))
+        self.cleanup_patterns = self.temp_cleanup_config.get('patterns', ['~$*', '*.tmp', '*~'])
+        self.min_file_age_minutes = self.temp_cleanup_config.get('min_file_age_minutes', 0)
+        self.clean_on_start = self.temp_cleanup_config.get('clean_on_start', True)
+        self.clean_on_end = self.temp_cleanup_config.get('clean_on_end', True)
+        self.dry_run = self.temp_cleanup_config.get('dry_run', False)
+        self.keep_empty_dirs = self.temp_cleanup_config.get('keep_empty_dirs', False)
         
         # 日志
         setup_logging(self.config)
         self.logger = logging.getLogger(__name__)
+        
+        # 如果启用清理且动作是移动，创建目标目录
+        if self.cleanup_enabled and self.cleanup_action == 'move':
+            self.cleanup_target_dir.mkdir(parents=True, exist_ok=True)
+    
+    def is_temp_file(self, file_path: Path) -> bool:
+        """
+        判断是否为临时文件
+        临时文件特征：
+        1. 以 ~$ 开头（Office临时文件）
+        2. 以 .tmp 结尾
+        3. 文件名包含 "~" 字符
+        """
+        if not self.skip_temp_files:
+            return False
+        
+        file_name = file_path.name
+        
+        # 检查 ~$ 开头的文件（Office临时文件）
+        if file_name.startswith('~$'):
+            self.logger.debug(f"识别为临时文件 (Office临时文件): {file_name}")
+            return True
+        
+        # 检查 .tmp 结尾的临时文件
+        if file_name.lower().endswith('.tmp'):
+            self.logger.debug(f"识别为临时文件 (.tmp文件): {file_name}")
+            return True
+        
+        # 检查包含 ~ 的文件（通常是备份或临时文件）
+        if '~' in file_name and not file_name.endswith(('.pptx', '.docx', '.ppt', '.doc')):
+            self.logger.debug(f"识别为临时文件 (包含~字符): {file_name}")
+            return True
+        
+        return False
+    
+    def should_cleanup_file(self, file_path: Path) -> bool:
+        """
+        判断文件是否应该被清理
+        根据配置的patterns和文件年龄
+        """
+        if not self.cleanup_enabled:
+            return False
+        
+        file_name = file_path.name
+        
+        # 检查是否匹配清理模式
+        matched = False
+        for pattern in self.cleanup_patterns:
+            if pattern.startswith('~$'):
+                # 处理 ~$* 模式
+                if pattern == '~$*' and file_name.startswith('~$'):
+                    matched = True
+                    break
+            elif pattern.endswith('*'):
+                # 处理前缀匹配
+                prefix = pattern[:-1]
+                if file_name.startswith(prefix):
+                    matched = True
+                    break
+            elif pattern.startswith('*'):
+                # 处理后缀匹配
+                suffix = pattern[1:]
+                if file_name.endswith(suffix):
+                    matched = True
+                    break
+            else:
+                # 精确匹配或使用fnmatch
+                from fnmatch import fnmatch
+                if fnmatch(file_name, pattern):
+                    matched = True
+                    break
+        
+        if not matched:
+            return False
+        
+        # 检查文件年龄
+        if self.min_file_age_minutes > 0:
+            try:
+                file_mtime = datetime.fromtimestamp(file_path.stat().st_mtime)
+                file_age = (datetime.now() - file_mtime).total_seconds() / 60
+                if file_age < self.min_file_age_minutes:
+                    self.logger.debug(f"文件年龄不足 ({file_age:.1f}分钟 < {self.min_file_age_minutes}分钟)，跳过清理: {file_name}")
+                    return False
+            except Exception as e:
+                self.logger.warning(f"检查文件年龄失败: {e}")
+        
+        return True
+    
+    def cleanup_temp_files(self, scan_directory: Path = None, is_startup: bool = False):
+        """
+        清理临时文件
+        :param scan_directory: 要扫描的目录，默认为源目录
+        :param is_startup: 是否为启动时清理（用于日志显示）
+        """
+        if not self.cleanup_enabled:
+            return
+        
+        if is_startup and not self.clean_on_start:
+            return
+        if not is_startup and not self.clean_on_end:
+            return
+        
+        scan_dir = scan_directory or self.source_dir
+        phase = "启动时" if is_startup else "完成后"
+        
+        if self.dry_run:
+            self.logger.info(f"🔍 {phase}临时文件清理 (试运行模式 - 不实际{'删除' if self.cleanup_action == 'delete' else '移动'}文件)")
+        else:
+            self.logger.info(f"🧹 {phase}临时文件清理 (动作: {'删除' if self.cleanup_action == 'delete' else f'移动到 {self.cleanup_target_dir}'})")
+        
+        # 查找所有临时文件
+        temp_files = []
+        
+        # 递归查找匹配模式的文件
+        for pattern in self.cleanup_patterns:
+            try:
+                # 转换pattern为glob格式
+                glob_pattern = pattern.replace('*', '*')
+                found = list(scan_dir.rglob(glob_pattern))
+                for f in found:
+                    if f.is_file() and self.should_cleanup_file(f):
+                        temp_files.append(f)
+            except Exception as e:
+                self.logger.debug(f"搜索模式 {pattern} 失败: {e}")
+        
+        # 去重
+        temp_files = list(set(temp_files))
+        
+        if not temp_files:
+            self.logger.info(f"  未找到需要清理的临时文件")
+            return
+        
+        self.logger.info(f"  找到 {len(temp_files)} 个临时文件")
+        
+        # 处理每个临时文件
+        for temp_file in temp_files:
+            try:
+                if self.dry_run:
+                    # 试运行模式，只记录
+                    self.logger.info(f"    [试运行] 将{'删除' if self.cleanup_action == 'delete' else '移动'}: {temp_file}")
+                    self.stats['cleaned_temp_files'] += 1
+                    self.cleaned_records.append({
+                        'file': str(temp_file),
+                        'action': self.cleanup_action,
+                        'status': 'dry_run',
+                        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    })
+                    continue
+                
+                if self.cleanup_action == 'delete':
+                    # 删除文件
+                    temp_file.unlink()
+                    self.logger.info(f"    ✅ 已删除: {temp_file.name}")
+                    action_str = "删除"
+                    
+                elif self.cleanup_action == 'move':
+                    # 移动到指定目录
+                    # 保持相对路径结构
+                    rel_path = temp_file.relative_to(scan_dir)
+                    target_path = self.cleanup_target_dir / rel_path
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    
+                    # 处理文件名冲突
+                    if target_path.exists():
+                        counter = 1
+                        stem = target_path.stem
+                        suffix = target_path.suffix
+                        while target_path.exists():
+                            new_name = f"{stem}_{counter}{suffix}"
+                            target_path = target_path.parent / new_name
+                            counter += 1
+                    
+                    shutil.move(str(temp_file), str(target_path))
+                    self.logger.info(f"    ✅ 已移动: {temp_file.name} -> {target_path}")
+                    action_str = "移动"
+                
+                self.stats['cleaned_temp_files'] += 1
+                self.cleaned_records.append({
+                    'file': str(temp_file),
+                    'target': str(target_path) if self.cleanup_action == 'move' else '',
+                    'action': action_str,
+                    'status': 'success',
+                    'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                })
+                
+            except Exception as e:
+                self.logger.error(f"    ❌ 处理失败 {temp_file.name}: {e}")
+                self.cleaned_records.append({
+                    'file': str(temp_file),
+                    'action': self.cleanup_action,
+                    'status': f'failed: {e}',
+                    'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                })
+        
+        # 清理空目录（如果不保留空目录）
+        if not self.keep_empty_dirs and not self.dry_run and self.cleanup_action == 'delete':
+            self._remove_empty_directories(scan_dir)
+        
+        self.logger.info(f"  {phase}临时文件清理完成，共处理 {self.stats['cleaned_temp_files']} 个文件")
+    
+    def _remove_empty_directories(self, directory: Path):
+        """递归删除空目录"""
+        try:
+            # 从最深层开始删除
+            for dirpath in sorted(directory.rglob('*'), key=lambda p: len(p.parts), reverse=True):
+                if dirpath.is_dir():
+                    try:
+                        if not any(dirpath.iterdir()):
+                            dirpath.rmdir()
+                            self.logger.debug(f"删除空目录: {dirpath}")
+                    except Exception:
+                        pass
+        except Exception as e:
+            self.logger.debug(f"清理空目录时出错: {e}")
     
     def get_target_path(self, file_path: Path, category: str, confidence: float) -> Optional[Path]:
         """获取目标文件路径"""
@@ -244,6 +491,12 @@ class FileClassifierMover:
     def process_single_file(self, file_path: Path) -> Tuple[bool, Optional[str], Optional[float]]:
         """处理单个文件"""
         try:
+            # 检查是否为临时文件
+            if self.is_temp_file(file_path):
+                self.stats['skipped_temp_file'] += 1
+                self.logger.info(f"  ⏭️  跳过临时文件: {file_path.name}")
+                return False, None, None
+            
             # 检查文件大小
             if not self.check_file_size(file_path):
                 return False, None, None
@@ -302,7 +555,7 @@ class FileClassifierMover:
             return False, None, None
     
     def find_files(self) -> List[Path]:
-        """查找所有需要处理的文件"""
+        """查找所有需要处理的文件（自动过滤临时文件）"""
         files = []
         
         # 支持的扩展名（不区分大小写）
@@ -311,13 +564,27 @@ class FileClassifierMover:
         if self.config['advanced']['recursive_scan']:
             # 递归搜索
             for ext in extensions:
-                files.extend(self.source_dir.rglob(f"*{ext}"))
-                files.extend(self.source_dir.rglob(f"*{ext.upper()}"))
+                found_files = list(self.source_dir.rglob(f"*{ext}"))
+                found_files.extend(self.source_dir.rglob(f"*{ext.upper()}"))
+                
+                # 过滤临时文件
+                for f in found_files:
+                    if not self.is_temp_file(f):
+                        files.append(f)
+                    else:
+                        self.logger.debug(f"搜索时跳过临时文件: {f.name}")
         else:
             # 仅搜索当前目录
             for ext in extensions:
-                files.extend(self.source_dir.glob(f"*{ext}"))
-                files.extend(self.source_dir.glob(f"*{ext.upper()}"))
+                found_files = list(self.source_dir.glob(f"*{ext}"))
+                found_files.extend(self.source_dir.glob(f"*{ext.upper()}"))
+                
+                # 过滤临时文件
+                for f in found_files:
+                    if not self.is_temp_file(f):
+                        files.append(f)
+                    else:
+                        self.logger.debug(f"搜索时跳过临时文件: {f.name}")
         
         # 去重
         files = list(set(files))
@@ -349,6 +616,29 @@ class FileClassifierMover:
         except Exception as e:
             self.logger.error(f"保存移动记录失败: {e}")
     
+    def save_cleanup_list(self):
+        """保存临时文件清理记录"""
+        if not self.config['logging'].get('save_cleanup_list', True):
+            return
+        
+        if not self.cleaned_records:
+            self.logger.info("没有临时文件清理记录")
+            return
+        
+        cleanup_list_file = self.config['logging'].get('cleanup_list_file', 'cleaned_files.csv')
+        cleanup_list_path = Path(cleanup_list_file)
+        
+        try:
+            with open(cleanup_list_path, 'w', newline='', encoding='utf-8-sig') as f:
+                fieldnames = ['file', 'target', 'action', 'status', 'timestamp']
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(self.cleaned_records)
+            
+            self.logger.info(f"清理记录已保存到: {cleanup_list_path}")
+        except Exception as e:
+            self.logger.error(f"保存清理记录失败: {e}")
+    
     def print_summary(self):
         """打印处理摘要"""
         print("\n" + "="*70)
@@ -358,6 +648,10 @@ class FileClassifierMover:
         print(f"✅ 成功处理: {self.stats['moved']} 个")
         print(f"❌ 处理失败: {self.stats['failed']} 个")
         
+        if self.stats['skipped_temp_file'] > 0:
+            print(f"⏭️  临时文件跳过: {self.stats['skipped_temp_file']} 个")
+        if self.stats['cleaned_temp_files'] > 0:
+            print(f"🧹 临时文件清理: {self.stats['cleaned_temp_files']} 个")
         if self.stats['skipped_low_confidence'] > 0:
             print(f"⚠️  置信度不足: {self.stats['skipped_low_confidence']} 个")
         if self.stats['skipped_size_limit'] > 0:
@@ -375,7 +669,7 @@ class FileClassifierMover:
                 print(f"   {category:10s}: {count:4d} 个 ({percentage:5.1f}%)")
         
         # 记录到日志
-        self.logger.info(f"处理完成 - 总计:{self.stats['total']}, 成功:{self.stats['moved']}, 失败:{self.stats['failed']}")
+        self.logger.info(f"处理完成 - 总计:{self.stats['total']}, 成功:{self.stats['moved']}, 失败:{self.stats['failed']}, 临时文件跳过:{self.stats['skipped_temp_file']}, 临时文件清理:{self.stats['cleaned_temp_files']}")
     
     def run(self):
         """运行主流程"""
@@ -386,7 +680,16 @@ class FileClassifierMover:
         print(f"目标目录: {self.target_base_dir}")
         print(f"置信度阈值: {self.threshold:.0%}")
         print(f"操作模式: {'移动' if self.move_files else '复制'}")
+        print(f"临时文件过滤: {'启用' if self.skip_temp_files else '禁用'}")
+        if self.cleanup_enabled:
+            print(f"🧹 临时文件清理: {'启用' if self.cleanup_enabled else '禁用'} ({self.cleanup_action})")
+            if self.dry_run:
+                print(f"   ⚠️  试运行模式 - 不会实际删除/移动文件")
         print("="*70)
+        
+        # 启动时清理临时文件
+        if self.cleanup_enabled and self.clean_on_start:
+            self.cleanup_temp_files(is_startup=True)
         
         # 查找文件
         files = self.find_files()
@@ -394,17 +697,21 @@ class FileClassifierMover:
         
         if not files:
             print(f"\n未找到支持的文件 (格式: {', '.join(self.supported_formats)})")
-            return
+        else:
+            print(f"\n找到 {len(files)} 个文件，开始处理...\n")
+            
+            # 处理每个文件
+            for i, file_path in enumerate(files, 1):
+                print(f"\n[{i}/{len(files)}] 处理: {file_path.name}")
+                self.process_single_file(file_path)
         
-        print(f"\n找到 {len(files)} 个文件，开始处理...\n")
-        
-        # 处理每个文件
-        for i, file_path in enumerate(files, 1):
-            print(f"\n[{i}/{len(files)}] 处理: {file_path.name}")
-            self.process_single_file(file_path)
+        # 完成后清理临时文件
+        if self.cleanup_enabled and self.clean_on_end:
+            self.cleanup_temp_files(is_startup=False)
         
         # 保存记录
         self.save_moved_list()
+        self.save_cleanup_list()
         
         # 打印统计
         self.print_summary()
@@ -414,6 +721,12 @@ class FileClassifierMover:
         print("\n" + "="*70)
         print("预览模式 - 仅显示分类结果，不实际移动文件")
         print("="*70)
+        
+        # 显示清理配置
+        if self.cleanup_enabled:
+            print(f"🧹 临时文件清理: {'启用' if self.cleanup_enabled else '禁用'} ({self.cleanup_action})")
+            if self.clean_on_start:
+                print(f"   ⚠️  启动时会清理临时文件（预览模式不会执行）")
         
         files = self.find_files()
         self.stats['total'] = len(files)
@@ -443,6 +756,7 @@ class FileClassifierMover:
                 
                 results.append({
                     'file': file_path.name,
+                    'full_path': str(file_path),
                     'predicted_class': predicted_class,
                     'confidence': confidence,
                     'meets_threshold': confidence >= self.threshold,
@@ -464,7 +778,7 @@ class FileClassifierMover:
         if save_preview == 'y':
             preview_file = Path("preview_results.csv")
             with open(preview_file, 'w', newline='', encoding='utf-8-sig') as f:
-                writer = csv.DictWriter(f, fieldnames=['file', 'predicted_class', 
+                writer = csv.DictWriter(f, fieldnames=['file', 'full_path', 'predicted_class', 
                                                        'confidence', 'meets_threshold', 
                                                        'embedded_used'])
                 writer.writeheader()
@@ -485,6 +799,14 @@ def main():
     parser.add_argument('--target', '-t', help='目标目录（覆盖配置文件中的设置）')
     parser.add_argument('--threshold', '-th', type=float, 
                        help='置信度阈值（覆盖配置文件中的设置）')
+    parser.add_argument('--include-temp', action='store_true',
+                       help='包含临时文件（默认跳过~$开头的临时文件）')
+    parser.add_argument('--cleanup', action='store_true',
+                       help='启用临时文件清理（覆盖配置文件设置）')
+    parser.add_argument('--cleanup-action', choices=['delete', 'move'],
+                       help='清理动作: delete(删除) 或 move(移动)')
+    parser.add_argument('--dry-run', action='store_true',
+                       help='试运行模式，只显示将要清理的文件，不实际执行')
     
     args = parser.parse_args()
     
@@ -499,12 +821,29 @@ def main():
             mover.target_base_dir = Path(args.target)
         if args.threshold is not None:
             mover.threshold = args.threshold
+        if args.include_temp:
+            mover.skip_temp_files = False
+        if args.cleanup:
+            mover.cleanup_enabled = True
+        if args.cleanup_action:
+            mover.cleanup_action = args.cleanup_action
+        if args.dry_run:
+            mover.dry_run = True
+            mover.cleanup_enabled = True  # 试运行模式自动启用清理
         
         if args.preview:
             mover.preview()
         else:
             # 确认执行
             print(f"\n将{'移动' if mover.move_files else '复制'}符合条件的文件到类别文件夹")
+            if mover.skip_temp_files:
+                print("⚠️  临时文件（~$开头）将被自动跳过")
+            if mover.cleanup_enabled:
+                if mover.dry_run:
+                    print(f"🧹 试运行模式: 将显示要清理的临时文件，不实际{'删除' if mover.cleanup_action == 'delete' else '移动'}")
+                else:
+                    print(f"🧹 临时文件清理: 将{ '删除' if mover.cleanup_action == 'delete' else f'移动到 {mover.cleanup_target_dir}'} 临时文件")
+            
             confirm = input("是否继续? (y/N): ").strip().lower()
             if confirm == 'y':
                 mover.run()

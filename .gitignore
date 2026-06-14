@@ -12,3 +12,16 @@ ci.py
 dict.txt
 8best/
 *.log
+*.onnx
+*.utf8
+
+build/
+dist/
+*.dylib
+*.so
+*.dll
+
+
+
+input/
+output/

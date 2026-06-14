@@ -226,7 +226,8 @@ python train.py
 ---
 
 ## 10. 使用训练后的模型
-[使用预测](./predict.md)
+[使用预测（进行测试）](./predict.md)
+[使用分类](./classifer.md)
 
 ---
 

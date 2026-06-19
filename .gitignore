@@ -20,6 +20,7 @@ dist/
 *.dylib
 *.so
 *.dll
+.cache/
 
 
 

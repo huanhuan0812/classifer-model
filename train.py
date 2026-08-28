@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PPTX/PPT/DOCX学科分类器训练脚本 (TextCNN) - 优化版
+PPTX/PPT/DOCX学科分类器训练脚本 (TextCNN) - 优化版（缓存修复版）
 支持8类别：语文、数学、英语、物理、化学、生物、班会
 支持文件格式：.pptx, .ppt, .docx
 核心特性：
 1. 文本权重70%，文件名权重30%（增强文本重要性）
 2. 文件名数据增强（模拟不同命名习惯）
 3. 多尺度卷积提取文本特征（增加kernel_size=2）
-4. 🔥 文件解析缓存（避免重复解析，大幅加速）
+4. 🔥 文件解析缓存（立即保存，避免重复解析，大幅加速）
 5. 类别权重处理（解决小样本类别不平衡）
 6. 🎯 支持指定科目只使用缓存（跳过解析，仅从缓存读取）
 7. 👤 人名去除（在缓存阶段使用jieba识别并过滤人名）
@@ -16,6 +16,7 @@ PPTX/PPT/DOCX学科分类器训练脚本 (TextCNN) - 优化版
 9. 💾 自动保存无依赖的Tokenizer（用于推理）
 10. 📝 输出JSON格式词表（便于外部工具使用）
 11. 📄 支持DOCX文件解析
+12. 🔍 增强缓存调试和验证
 """
 
 import os
@@ -92,7 +93,7 @@ CV_FOLDS = 5
 
 # 缓存配置
 ENABLE_CACHE = True
-CACHE_VERSION = "v5"          # 更新缓存版本（添加了DOCX支持）
+CACHE_VERSION = "v6"          # 更新缓存版本（修复保存问题）
 FORCE_REFRESH_CACHE = False
 
 # 类别权重配置
@@ -468,27 +469,67 @@ def extract_text_from_pptx(pptx_path, extract_embedded=True):
         return ""
 
 
-# ---------- 缓存管理类 ----------
+# ---------- 缓存管理类（增强版） ----------
 class FileCache:
-    """文件解析缓存管理器（支持PPTX、DOCX）"""
+    """文件解析缓存管理器（支持立即保存、增强调试）"""
     
     def __init__(self, cache_dir=CACHE_DIR, version=CACHE_VERSION):
         self.cache_dir = Path(cache_dir)
         self.version = version
         self.text_cache_file = self.cache_dir / f"file_cache_{version}.json"
         self.metadata_file = self.cache_dir / f"cache_metadata_{version}.json"
+        self.debug_file = self.cache_dir / f"cache_debug_{version}.log"
         
         # 创建缓存目录
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            print(f"  📁 缓存目录: {self.cache_dir.absolute()}")
+        except Exception as e:
+            print(f"  ⚠️ 警告: 无法创建缓存目录 ({e})")
         
         # 加载现有缓存
         self.text_cache = self._load_cache()
         self.metadata = self._load_metadata()
         self._last_was_cache_hit = False
         
-        # 统计人名去除情况
+        # 统计信息
         self.names_removed_count = 0
         self.name_removal_stats = {}
+        self.cache_save_count = 0
+        self.cache_hit_count = 0
+        self.cache_miss_count = 0
+        
+        # 调试信息
+        self._debug_enabled = True
+        self._debug_log = []
+        
+        # 打印缓存状态
+        print(f"  📊 加载缓存: {len(self.text_cache)} 个文件")
+        non_empty = sum(1 for v in self.text_cache.values() if v)
+        if non_empty > 0:
+            print(f"  ✅ 非空条目: {non_empty}")
+        else:
+            print(f"  ⚠️  缓存为空或全是空内容")
+    
+    def _log_debug(self, msg):
+        """记录调试信息"""
+        if self._debug_enabled:
+            timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            log_msg = f"[{timestamp}] {msg}"
+            self._debug_log.append(log_msg)
+            print(f"  🔍 {log_msg}")
+    
+    def _save_debug_log(self):
+        """保存调试日志到文件"""
+        try:
+            with open(self.debug_file, 'w', encoding='utf-8') as f:
+                f.write(f"缓存调试日志 - {datetime.now().isoformat()}\n")
+                f.write("="*50 + "\n")
+                for line in self._debug_log:
+                    f.write(line + "\n")
+            return True
+        except Exception as e:
+            return False
     
     def _get_file_hash(self, filepath):
         """计算文件的哈希值（用于检测文件是否变化）"""
@@ -509,10 +550,19 @@ class FileCache:
             try:
                 with open(self.text_cache_file, 'r', encoding='utf-8') as f:
                     cache = json.load(f)
-                print(f"  加载文件缓存: {len(cache)} 个文件")
                 return cache
+            except json.JSONDecodeError as e:
+                print(f"  ⚠️  警告: 缓存文件损坏 ({e})，将重新生成")
+                # 备份损坏的缓存
+                backup_file = self.text_cache_file.with_suffix('.json.bak')
+                try:
+                    self.text_cache_file.rename(backup_file)
+                    print(f"  📦 已备份损坏的缓存到: {backup_file}")
+                except:
+                    pass
+                return {}
             except Exception as e:
-                print(f"  警告: 加载缓存失败 ({e})，将重新生成")
+                print(f"  ⚠️  警告: 加载缓存失败 ({e})，将重新生成")
                 return {}
         return {}
     
@@ -530,29 +580,76 @@ class FileCache:
         return {}
     
     def _save_cache(self):
-        """保存缓存到磁盘"""
+        """保存缓存到磁盘（立即保存）"""
         if not ENABLE_CACHE:
             return
         
         try:
+            # 检查是否有内容
+            if not self.text_cache:
+                self._log_debug("⚠️  缓存为空，跳过保存")
+                return
+            
+            # 统计有效内容
+            total_entries = len(self.text_cache)
+            non_empty = sum(1 for v in self.text_cache.values() if v)
+            empty_entries = total_entries - non_empty
+            
+            self._log_debug(f"💾 准备保存: {total_entries} 个文件，{non_empty} 个非空，{empty_entries} 个空")
+            
+            if non_empty == 0:
+                self._log_debug("⚠️  没有非空内容，跳过保存")
+                return
+            
+            # 保存主缓存
             with open(self.text_cache_file, 'w', encoding='utf-8') as f:
                 json.dump(self.text_cache, f, ensure_ascii=False, indent=2)
+            
+            # 保存元数据
             with open(self.metadata_file, 'w', encoding='utf-8') as f:
                 json.dump(self.metadata, f, ensure_ascii=False, indent=2)
-            print(f"  缓存已保存: {len(self.text_cache)} 个文件")
+            
+            self.cache_save_count += 1
+            
+            # 验证保存是否成功
+            if self.text_cache_file.exists():
+                file_size = self.text_cache_file.stat().st_size
+                self._log_debug(f"✅ 缓存已保存: {file_size} bytes")
+                
+                # 验证文件内容
+                try:
+                    with open(self.text_cache_file, 'r', encoding='utf-8') as f:
+                        verify_data = json.load(f)
+                        verify_count = len(verify_data)
+                        if verify_count == total_entries:
+                            self._log_debug(f"✅ 验证通过: {verify_count} 个条目")
+                        else:
+                            self._log_debug(f"⚠️  验证失败: 保存了 {verify_count} 个条目，期望 {total_entries}")
+                except Exception as e:
+                    self._log_debug(f"⚠️  验证失败: {e}")
+            else:
+                self._log_debug(f"❌ 缓存文件未创建!")
             
             # 保存人名去除统计
-            stats_file = self.cache_dir / f"name_removal_stats_{self.version}.json"
-            with open(stats_file, 'w', encoding='utf-8') as f:
-                json.dump({
-                    'names_removed_count': self.names_removed_count,
-                    'name_removal_stats': self.name_removal_stats,
-                    'removal_enabled': REMOVE_PERSON_NAMES,
-                    'cache_version': self.version
-                }, f, ensure_ascii=False, indent=2)
+            if REMOVE_PERSON_NAMES and (self.names_removed_count > 0 or self.name_removal_stats):
+                stats_file = self.cache_dir / f"name_removal_stats_{self.version}.json"
+                with open(stats_file, 'w', encoding='utf-8') as f:
+                    json.dump({
+                        'names_removed_count': self.names_removed_count,
+                        'name_removal_stats': self.name_removal_stats,
+                        'removal_enabled': REMOVE_PERSON_NAMES,
+                        'cache_version': self.version,
+                        'total_files': len(self.text_cache)
+                    }, f, ensure_ascii=False, indent=2)
+                self._log_debug(f"✅ 人名去除统计已保存")
+                
+            # 保存调试日志
+            self._save_debug_log()
                 
         except Exception as e:
-            print(f"  警告: 保存缓存失败 ({e})")
+            self._log_debug(f"❌ 保存缓存失败: {e}")
+            import traceback
+            self._log_debug(traceback.format_exc())
     
     def get(self, filepath):
         """获取缓存的文件内容"""
@@ -563,27 +660,58 @@ class FileCache:
         filepath = str(filepath)
         current_hash = self._get_file_hash(filepath)
         
+        self._log_debug(f"📖 get: {Path(filepath).name}")
+        self._log_debug(f"   - 在缓存中: {filepath in self.text_cache}")
+        
         if filepath in self.text_cache:
             cached_hash = self.metadata.get(filepath, {}).get('hash')
+            content = self.text_cache[filepath]
+            content_len = len(content) if content else 0
+            
+            self._log_debug(f"   - 内容长度: {content_len}")
+            self._log_debug(f"   - 哈希匹配: {cached_hash == current_hash}")
+            
             if cached_hash == current_hash:
                 self._last_was_cache_hit = True
-                return self.text_cache[filepath]
+                self.cache_hit_count += 1
+                self._log_debug(f"   ✅ 缓存命中")
+                return content
+            else:
+                self._log_debug(f"   ⚠️  哈希不匹配，需要重新解析")
+        else:
+            self._log_debug(f"   ⚠️  不在缓存中")
         
         self._last_was_cache_hit = False
+        self.cache_miss_count += 1
         return None
     
-    def set(self, filepath, text_content):
-        """设置缓存（在保存前应用人名去除）"""
+    def set(self, filepath, text_content, force_save=False):
+        """
+        设置缓存并立即保存
+        
+        Args:
+            filepath: 文件路径
+            text_content: 文本内容
+            force_save: 是否强制保存（即使内容为空）
+        """
         if not ENABLE_CACHE:
             return
         
         filepath = str(filepath)
+        original_len = len(text_content) if text_content else 0
+        
+        self._log_debug(f"💾 set: {Path(filepath).name}")
+        self._log_debug(f"   - 原始内容长度: {original_len}")
         
         # 在缓存阶段应用人名去除
         if REMOVE_PERSON_NAMES and text_content:
-            original_len = len(text_content)
             cleaned_content = remove_person_names_from_text(text_content)
-            removed_count = original_len - len(cleaned_content)
+            cleaned_len = len(cleaned_content) if cleaned_content else 0
+            removed_count = original_len - cleaned_len
+            
+            self._log_debug(f"   - 人名去除后长度: {cleaned_len}")
+            if removed_count > 0:
+                self._log_debug(f"   - 去除字符数: {removed_count}")
             
             if removed_count > 0:
                 self.names_removed_count += removed_count
@@ -592,21 +720,31 @@ class FileCache:
                 filename = Path(filepath).name
                 self.name_removal_stats[filename] = {
                     'original_length': original_len,
-                    'cleaned_length': len(cleaned_content),
+                    'cleaned_length': cleaned_len,
                     'removed_chars': removed_count,
                     'removal_ratio': removed_count / original_len if original_len > 0 else 0
                 }
             
             text_content = cleaned_content
+        elif not text_content and not force_save:
+            self._log_debug(f"   ⚠️  内容为空且未强制保存，跳过缓存")
+            return
         
-        self.text_cache[filepath] = text_content
+        # 更新缓存
+        self.text_cache[filepath] = text_content or ""
         self.metadata[filepath] = {
             'hash': self._get_file_hash(filepath),
             'cached_at': datetime.now().isoformat(),
             'file_size': Path(filepath).stat().st_size if Path(filepath).exists() else 0,
             'names_removed': REMOVE_PERSON_NAMES,
-            'file_type': Path(filepath).suffix.lower()
+            'file_type': Path(filepath).suffix.lower(),
+            'content_length': len(text_content) if text_content else 0
         }
+        
+        self._log_debug(f"   ✅ 缓存已更新")
+        
+        # 立即保存到磁盘
+        self._save_cache()
     
     def clear(self):
         """清空缓存"""
@@ -614,24 +752,36 @@ class FileCache:
         self.metadata = {}
         self.names_removed_count = 0
         self.name_removal_stats = {}
+        self.cache_save_count = 0
+        
         if self.text_cache_file.exists():
             self.text_cache_file.unlink()
         if self.metadata_file.exists():
             self.metadata_file.unlink()
-        print("  缓存已清空")
+        
+        self._log_debug("🗑️  缓存已清空")
+        print("  ✅ 缓存已清空")
     
     def save(self):
-        """保存缓存"""
+        """保存缓存（兼容旧接口）"""
         self._save_cache()
     
     def get_stats(self):
         """获取缓存统计信息"""
+        total_entries = len(self.text_cache)
+        non_empty = sum(1 for v in self.text_cache.values() if v)
+        
         return {
-            'cached_files': len(self.text_cache),
+            'cached_files': total_entries,
+            'non_empty': non_empty,
+            'empty_entries': total_entries - non_empty,
             'cache_file_size': self.text_cache_file.stat().st_size if self.text_cache_file.exists() else 0,
             'metadata_file_size': self.metadata_file.stat().st_size if self.metadata_file.exists() else 0,
             'names_removed_total': self.names_removed_count,
-            'files_with_names_removed': len(self.name_removal_stats)
+            'files_with_names_removed': len(self.name_removal_stats),
+            'cache_save_count': self.cache_save_count,
+            'cache_hit_count': self.cache_hit_count,
+            'cache_miss_count': self.cache_miss_count
         }
     
     def has_cache(self, filepath):
@@ -650,10 +800,10 @@ class FileCache:
     def print_name_removal_summary(self):
         """打印人名去除摘要"""
         if not REMOVE_PERSON_NAMES:
-            print("\n人名去除: 已禁用")
+            print("\n👤 人名去除: 已禁用")
             return
         
-        print(f"\n人名去除统计:")
+        print(f"\n👤 人名去除统计:")
         print(f"  总共去除字符数: {self.names_removed_count}")
         print(f"  涉及文件数: {len(self.name_removal_stats)}")
         
@@ -669,6 +819,17 @@ class FileCache:
                 print(f"  去除最多人名的文件:")
                 for filename, stats in sorted_files:
                     print(f"    - {filename[:40]}: 去除 {stats['removed_chars']} 字符 ({stats['removal_ratio']*100:.1f}%)")
+    
+    def print_cache_summary(self):
+        """打印缓存摘要"""
+        stats = self.get_stats()
+        print(f"\n📊 缓存摘要:")
+        print(f"  总缓存条目: {stats['cached_files']}")
+        print(f"  非空条目: {stats['non_empty']}")
+        print(f"  空条目: {stats['empty_entries']}")
+        print(f"  缓存命中: {stats['cache_hit_count']}")
+        print(f"  缓存未命中: {stats['cache_miss_count']}")
+        print(f"  保存次数: {stats['cache_save_count']}")
 
 
 # 全局缓存实例
@@ -762,19 +923,41 @@ def cut_words(text):
 
 
 def process_file(filepath, cat, label_idx, stats, skip_parsing=False):
-    """处理单个文件（支持PPTX、DOCX）"""
-    filename_raw, original_filename = extract_filename_features(str(filepath))
+    """处理单个文件（支持PPTX、DOCX）- 立即缓存"""
+    cache = get_cache()
+    filepath_str = str(filepath)
+    
+    filename_raw, original_filename = extract_filename_features(filepath_str)
     filename_processed = process_filename_text(filename_raw)
     
-    if skip_parsing:
-        cache = get_cache()
-        cached_text = cache.get(str(filepath))
+    # 检查缓存
+    cached_text = cache.get(filepath_str)
+    
+    if cached_text is not None and not skip_parsing:
+        # 缓存命中，直接使用缓存内容
+        raw_text = cached_text
+        stats['cache_hits'] += 1
+        stats['cache_used'] += 1
+    elif skip_parsing:
+        # 跳过解析模式，必须从缓存读取
         if cached_text is None:
             stats['cache_missing_skip'] += 1
             return None, None, None, False
         raw_text = cached_text
+        stats['cache_used'] += 1
     else:
-        raw_text = extract_text_from_file(str(filepath))
+        # 缓存未命中，解析文件
+        raw_text = extract_text_from_file(filepath_str)
+        stats['cache_misses'] += 1
+        
+        # 立即保存到缓存（即使内容为空也保存，避免重复解析失败）
+        if raw_text:
+            cache.set(filepath_str, raw_text)
+            stats['cache_saved'] += 1
+        else:
+            # 对于空内容，也保存空字符串，避免重复尝试解析
+            cache.set(filepath_str, "", force_save=True)
+            stats['cache_saved_empty'] += 1
     
     # 注意：raw_text 已经从缓存中获取，且已经在缓存阶段去除了人名
     
@@ -810,7 +993,7 @@ def extract_filename_features(filepath):
 
 
 def load_data_with_cache(data_root):
-    """带缓存的加载函数（支持PPTX和DOCX）"""
+    """带缓存的加载函数（支持PPTX和DOCX，立即保存缓存）"""
     texts = []
     filenames = []
     labels = []
@@ -826,6 +1009,9 @@ def load_data_with_cache(data_root):
         'success': 0,
         'cache_hits': 0,
         'cache_misses': 0,
+        'cache_used': 0,
+        'cache_saved': 0,
+        'cache_saved_empty': 0,
         'cache_missing_skip': 0,
         'skipped_categories': 0,
         'by_category': {},
@@ -909,12 +1095,6 @@ def load_data_with_cache(data_root):
                     print(f"  ... 已处理 {idx + 1}/{len(files)} 个文件")
                 continue
             
-            if hasattr(cache, '_last_was_cache_hit'):
-                if cache._last_was_cache_hit:
-                    stats['cache_hits'] += 1
-                else:
-                    stats['cache_misses'] += 1
-            
             filename_variants = [filename_processed]
             if ENABLE_FILENAME_AUGMENTATION and filename_processed:
                 augmented_variants = augment_filename(original_filename)
@@ -940,6 +1120,9 @@ def load_data_with_cache(data_root):
             
             if (idx + 1) % 20 == 0:
                 print(f"  ... 已处理 {idx + 1}/{len(files)} 个文件")
+                # 每处理20个文件，显示一次缓存状态
+                cache_stats = cache.get_stats()
+                print(f"     缓存: {cache_stats['cached_files']} 个文件, {cache_stats['non_empty']} 非空")
         
         cat_stats = stats['by_category'][cat]
         if skip_parsing:
@@ -963,6 +1146,13 @@ def print_stats(stats):
     if stats['success'] > 0:
         print(f"  └─ 增强比例:   {stats['augmented_count']/stats['success']*100:.1f}%")
     
+    print(f"\n缓存统计:")
+    print(f"  缓存命中:      {stats.get('cache_hits', 0)}")
+    print(f"  缓存未命中:    {stats.get('cache_misses', 0)}")
+    print(f"  缓存使用:      {stats.get('cache_used', 0)}")
+    print(f"  缓存保存:      {stats.get('cache_saved', 0)}")
+    print(f"  缓存保存空:    {stats.get('cache_saved_empty', 0)}")
+    
     if stats.get('cache_missing_skip', 0) > 0:
         print(f"\n⚠️  跳过解析模式中因缓存缺失跳过的文件: {stats['cache_missing_skip']}")
     
@@ -979,10 +1169,11 @@ def print_stats(stats):
     
     cache = get_cache()
     cache_stats = cache.get_stats()
-    print(f"\n缓存统计:")
-    print(f"  缓存文件数:    {cache_stats['cached_files']}")
-    print(f"  缓存命中:      {stats.get('cache_hits', 0)}")
-    print(f"  缓存未命中:    {stats.get('cache_misses', 0)}")
+    print(f"\n缓存详细统计:")
+    print(f"  总缓存条目:    {cache_stats['cached_files']}")
+    print(f"  非空条目:      {cache_stats['non_empty']}")
+    print(f"  空条目:        {cache_stats['empty_entries']}")
+    print(f"  缓存文件大小:  {cache_stats['cache_file_size'] / 1024:.1f} KB")
     
     # 打印人名去除统计
     if REMOVE_PERSON_NAMES:
@@ -1374,7 +1565,7 @@ def save_json_vocabularies(text_tokenizer, filename_tokenizer):
 # ---------- 主流程 ----------
 def main():
     print("="*50)
-    print("文件学科分类器训练（优化版）")
+    print("文件学科分类器训练（优化版 - 缓存修复）")
     print(f"支持类别: {', '.join(CATEGORIES)}")
     print(f"支持格式: {', '.join(SUPPORTED_EXTENSIONS)}")
     print(f"文本权重: {TEXT_WEIGHT}, 文件名权重: {FILENAME_WEIGHT}")
@@ -1400,7 +1591,7 @@ def main():
         cache.clear()
     
     # 1. 加载数据
-    print("\n步骤1: 加载文件（使用缓存加速，缓存阶段自动去除人名）...")
+    print("\n步骤1: 加载文件（使用缓存加速，立即保存）...")
     import time
     start_time = time.time()
     texts, filenames, labels, stats = load_data_with_cache(DATA_ROOT)
@@ -1412,7 +1603,10 @@ def main():
     # 打印人名去除详情
     cache = get_cache()
     cache.print_name_removal_summary()
+    cache.print_cache_summary()
     
+    # 最终保存缓存（确保所有数据都已保存）
+    print("\n💾 最终保存缓存...")
     cache.save()
     
     if len(texts) == 0:
@@ -1597,6 +1791,7 @@ def main():
     print(f"\n缓存目录: {CACHE_DIR}/")
     print(f"  - file_cache_{CACHE_VERSION}.json")
     print(f"  - cache_metadata_{CACHE_VERSION}.json")
+    print(f"  - cache_debug_{CACHE_VERSION}.log")
     if REMOVE_PERSON_NAMES:
         print(f"  - name_removal_stats_{CACHE_VERSION}.json")
     print("="*50)

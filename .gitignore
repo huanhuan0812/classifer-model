@@ -24,7 +24,11 @@ dist/
 *.so
 *.dll
 .cache/
+.vscode/
+*.json
+*.png
 
+models-1/
 
 
 input/

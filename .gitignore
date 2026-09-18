@@ -15,6 +15,9 @@ dict.txt
 *.onnx
 *.utf8
 
+# 模型产物目录（TensorFlow/Keras 与 ONNX）
+models/
+
 build/
 dist/
 *.dylib

@@ -60,11 +60,24 @@ python --version
 
 #### 步骤2：下载项目文件
 
-将以下文件放在同一目录下：
-- `predict_onnx.py` - 分类器核心文件
-- `file_mover.py` - 文件移动主程序
-- `file_classifier_config.yaml` - 配置文件
-- 模型文件（.onnx, .pkl文件）
+项目目录结构如下（`run/` 为运行分类代码，`models/onnx/` 为模型文件）：
+
+```
+项目根目录/
+├── run/
+│   ├── predict_onnx.py             # 分类器核心文件
+│   ├── file_mover.py               # 文件移动主程序
+│   ├── run_mover.py                # 快速启动脚本
+│   ├── server-api.py               # API 服务
+│   ├── predict_onnx_ocrtest.py     # 带 OCR 的预测脚本
+│   ├── extract.py                  # 文本提取工具
+│   ├── cleanup_temp_only.py        # 临时文件清理
+│   ├── test_cleanup.py             # 清理功能测试
+│   └── file_classifier_config.yaml # 配置文件
+└── models/
+    ├── onnx/                       # 推理所需模型文件（.onnx, .pkl）
+    └── tensorflow/                # Keras 模型 + 训练产物
+```
 
 #### 步骤3：安装依赖包
 
@@ -92,7 +105,7 @@ pip install onnxruntime python-pptx jieba python-docx pyyaml
 
 运行预览模式测试：
 ```bash
-python file_mover.py --preview
+python run/file_mover.py --preview
 ```
 
 如果看到帮助信息，说明安装成功。
@@ -113,7 +126,7 @@ python file_mover.py --preview
 
 2. **编辑配置文件**
    
-   打开 `file_classifier_config.yaml`，设置源目录：
+   打开 `run/file_classifier_config.yaml`，设置源目录：
    ```yaml
    paths:
      source_dir: "./input"      # 你的文件所在文件夹
@@ -122,14 +135,14 @@ python file_mover.py --preview
 
 3. **预览模式（推荐）**
    ```bash
-   python file_mover.py --preview
+   python run/file_mover.py --preview
    ```
    
    查看每个文件的分类结果，确认是否准确。
 
 4. **执行移动**
    ```bash
-   python file_mover.py
+   python run/file_mover.py
    ```
    
    输入 `y` 确认，程序将自动分类并移动文件。
@@ -280,35 +293,35 @@ advanced:
 
 ```bash
 # 显示帮助
-python file_mover.py -h
+python run/file_mover.py -h
 
 # 使用默认配置运行
-python file_mover.py
+python run/file_mover.py
 
 # 预览模式（不实际移动）
-python file_mover.py --preview
+python run/file_mover.py --preview
 
 # 指定配置文件
-python file_mover.py --config my_config.yaml
+python run/file_mover.py --config my_config.yaml
 
 # 覆盖源目录
-python file_mover.py --source ./my_files
+python run/file_mover.py --source ./my_files
 
 # 覆盖目标目录
-python file_mover.py --target ./my_output
+python run/file_mover.py --target ./my_output
 
 # 覆盖置信度阈值
-python file_mover.py --threshold 0.8
+python run/file_mover.py --threshold 0.8
 
 # 组合使用
-python file_mover.py --source ./data --target ./result --threshold 0.85 --preview
+python run/file_mover.py --source ./data --target ./result --threshold 0.85 --preview
 ```
 
 #### 2. 交互式运行
 
 ```bash
 # 启动程序
-python file_mover.py
+python run/file_mover.py
 
 # 程序会显示配置信息并要求确认
 ==================================================
@@ -345,7 +358,7 @@ prediction:
 
 **操作**：
 ```bash
-python file_mover.py
+python run/file_mover.py
 ```
 
 #### 场景2：批量处理大文件
@@ -363,7 +376,7 @@ advanced:
 
 **操作**：
 ```bash
-python file_mover.py --threshold 0.85
+python run/file_mover.py --threshold 0.85
 ```
 
 #### 场景3：只处理某些学科
@@ -384,10 +397,10 @@ categories:
 **操作**：
 ```bash
 # 先预览
-python file_mover.py --preview
+python run/file_mover.py --preview
 
 # 确认无误后再执行
-python file_mover.py
+python run/file_mover.py
 ```
 
 ---
@@ -455,10 +468,10 @@ file_handling:
 
 ```bash
 # 只处理特定格式
-python file_mover.py --source ./mixed_files
+python run/file_mover.py --source ./mixed_files
 
 # 高阈值严格模式
-python file_mover.py --threshold 0.9
+python run/file_mover.py --threshold 0.9
 
 # 复制而非移动（保留原文件）
 # 在配置文件中设置 move_files: false
@@ -471,8 +484,8 @@ python file_mover.py --threshold 0.9
 ```batch
 @echo off
 echo 开始处理文件...
-python file_mover.py --source ./folder1 --target ./result1
-python file_mover.py --source ./folder2 --target ./result2
+python run/file_mover.py --source ./folder1 --target ./result1
+python run/file_mover.py --source ./folder2 --target ./result2
 echo 处理完成！
 pause
 ```
@@ -482,8 +495,8 @@ pause
 ```bash
 #!/bin/bash
 echo "开始处理文件..."
-python file_mover.py --source ./folder1 --target ./result1
-python file_mover.py --source ./folder2 --target ./result2
+python run/file_mover.py --source ./folder1 --target ./result1
+python run/file_mover.py --source ./folder2 --target ./result2
 echo "处理完成！"
 ```
 
@@ -518,7 +531,7 @@ echo "处理完成！"
 
 **A**: 使用预览模式：
 ```bash
-python file_mover.py --preview
+python run/file_mover.py --preview
 ```
 会显示所有文件的分类结果而不实际移动。
 
@@ -656,19 +669,25 @@ rm file_mover.log
 
 ```
 项目文件夹/
-├── predict_onnx.py              # 分类器核心
-├── file_mover.py                # 移动程序
-├── file_classifier_config.yaml  # 配置文件
-├── textcnn_classifier.onnx      # ONNX模型
-├── text_tokenizer_none.pkl      # 文本分词器
-├── filename_tokenizer_none.pkl  # 文件名分词器
-├── categories.pkl               # 类别映射
-├── config_optimized.pkl         # 配置
+├── run/
+│   ├── predict_onnx.py              # 分类器核心
+│   ├── file_mover.py                # 移动程序
+│   └── file_classifier_config.yaml  # 配置文件
+├── models/
+│   └── onnx/
+│       ├── textcnn_classifier.onnx      # ONNX模型
+│       ├── text_tokenizer_none.pkl      # 文本分词器
+│       ├── filename_tokenizer_none.pkl  # 文件名分词器
+│       ├── categories.pkl               # 类别映射
+│       └── config_optimized.pkl         # 配置
 ├── input/                       # 源文件目录
 ├── output/                      # 输出目录
-├── file_mover.log              # 运行日志
-└── moved_files.csv             # 移动记录
+├── file_mover.log               # 运行日志
+└── moved_files.csv              # 移动记录
 ```
+
+> 运行命令请在**项目根目录**执行，例如 `python run/file_mover.py --preview`；
+> 模型文件由 `train.py` 训练后自动生成到 `models/onnx/`（`models/tensorflow/` 存放 Keras 产物）。
 
 ### 配置文件模板
 

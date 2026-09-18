@@ -28,6 +28,8 @@
 - 自动去除人名（基于 jieba 词性标注）
 - 词表截断（限制在 20000 词以内）
 - 输出 JSON 格式词表，便于外部工具使用
+- 🔥 训练结束后自动导出 ONNX 模型（转换已合并进 `train.py`，一次性完成）
+- 📦 模型统一输出到 `models/`，`tensorflow/` 与 `onnx/` 分开放置
 
 ---
 
@@ -108,13 +110,27 @@ print("所有依赖已安装")
 python train.py
 ```
 
-### 5.2 强制刷新缓存
+训练流程会自动完成：训练 → 评估 → 保存 Keras 模型/Tokenizer → 导出 ONNX 模型。
+
+> ONNX 导出需要额外依赖：`pip install tf2onnx onnx`。
+> 若未安装，训练仍会正常完成，并提示跳过 ONNX 导出。
+
+### 5.2 仅重新导出 ONNX（不训练）
+
+```bash
+python train.py --export-onnx-only
+```
+
+会把 `models/tensorflow/textcnn_optimized_classifier.keras` 重新导出为
+`models/onnx/textcnn_classifier.onnx`（可用 `--keras-model` / `--config` 指定其它路径）。
+
+### 5.3 强制刷新缓存
 
 ```python
 FORCE_REFRESH_CACHE = True
 ```
 
-### 5.3 指定科目仅使用缓存
+### 5.4 指定科目仅使用缓存
 
 ```python
 SKIP_CATEGORIES = ["语文", "数学"]
@@ -157,7 +173,9 @@ SKIP_CATEGORIES = ["语文", "数学"]
 
 ## 7. 输出文件说明
 
-训练完成后，脚本会在当前目录生成以下文件：
+训练完成后，产物按框架分别写入 `models/tensorflow/` 与 `models/onnx/`：
+
+**`models/tensorflow/`（TensorFlow/Keras 训练产物）**
 
 | 文件名 | 说明 |
 |--------|------|
@@ -170,10 +188,27 @@ SKIP_CATEGORIES = ["语文", "数学"]
 | `categories.pkl` | 类别列表 |
 | `config_optimized.pkl` | 训练配置 |
 | `text_vocabulary.json` | 文本词表（JSON） |
+| `text_vocabulary_simple.json` | 文本词表（简洁版） |
 | `filename_vocabulary.json` | 文件名词表（JSON） |
+| `filename_vocabulary_simple.json` | 文件名词表（简洁版） |
 | `category_mapping.json` | 类别映射 |
 | `word_frequency_report.json` | 词频统计报告 |
 | `training_history.png` | 训练曲线图 |
+
+**`models/onnx/`（ONNX 推理产物，可与 `run/` 一起部署）**
+
+| 文件名 | 说明 |
+|--------|------|
+| `textcnn_classifier.onnx` | ONNX 格式模型（训练后自动转换） |
+| `text_tokenizer_none.pkl` | 文本 Tokenizer（无依赖版，自动复制） |
+| `filename_tokenizer_none.pkl` | 文件名 Tokenizer（无依赖版，自动复制） |
+| `categories.pkl` | 类别列表（自动复制） |
+| `config_optimized.pkl` | 训练配置（自动复制） |
+
+**缓存目录**
+
+| 文件 | 说明 |
+|------|------|
 | `../cache/file_cache_*.json` | 文件内容缓存 |
 | `../cache/name_removal_stats_*.json` | 人名去除统计 |
 
@@ -226,8 +261,19 @@ python train.py
 ---
 
 ## 10. 使用训练后的模型
-[使用预测（进行测试）](./predict.md)
-[使用分类](./classifer.md)
+
+分类/推理相关脚本统一放在 `run/` 目录，模型产物放在 `models/`：
+
+```bash
+python run/predict_onnx.py 语文.pptx      # 单文件预测（ONNX）
+python run/predict_onnx.py ./files --batch --recursive
+python run/file_mover.py --preview        # 按分类结果移动文件
+python run/server-api.py                  # 启动 API 服务
+```
+
+- [使用预测（进行测试）](./predict.md)
+- [使用分类](./classifer.md)
+- [ONNX 导出说明](./convert_to_onnx.md)
 
 ---
 
@@ -246,4 +292,4 @@ python train.py
 ---
 
 **版本**：v5  
-**最后更新**：2026-06-06
+**最后更新**：2026-09-18

@@ -56,12 +56,20 @@ from tensorflow.keras.preprocessing.sequence import pad_sequences
 import jieba
 from pptx import Presentation
 
+# ---------- 路径配置 ----------
+# 脚本位于 run/，Keras 模型产物位于项目根目录：
+#   models/tensorflow - Keras 模型 + 训练产物
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+TF_MODEL_DIR = PROJECT_ROOT / "models" / "tensorflow"
+ONNX_MODEL_DIR = PROJECT_ROOT / "models" / "onnx"
+
 # ---------- 配置 ----------
-MODEL_PATH = "textcnn_balanced_classifier.keras"
-TEXT_TOKENIZER_PATH = "text_tokenizer.pkl"
-FILENAME_TOKENIZER_PATH = "filename_tokenizer.pkl"
-CATEGORIES_PATH = "categories.pkl"
-CONFIG_PATH = "config_balanced.pkl"
+MODEL_PATH = str(TF_MODEL_DIR / "textcnn_optimized_classifier.keras")
+TEXT_TOKENIZER_PATH = str(TF_MODEL_DIR / "text_tokenizer.pkl")
+FILENAME_TOKENIZER_PATH = str(TF_MODEL_DIR / "filename_tokenizer.pkl")
+CATEGORIES_PATH = str(TF_MODEL_DIR / "categories.pkl")
+CONFIG_PATH = str(TF_MODEL_DIR / "config_optimized.pkl")
 
 # 停用词表（与训练时保持一致）
 STOPWORDS = set([

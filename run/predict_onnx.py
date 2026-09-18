@@ -44,12 +44,21 @@ except ImportError:
     DOCX_SUPPORT = False
     print("警告: python-docx未安装，docx文件支持将受限。请运行: pip install python-docx")
 
+# ---------- 路径配置 ----------
+# 脚本位于 run/，模型产物位于项目根目录：
+#   models/tensorflow - Keras 模型 + 训练产物
+#   models/onnx       - ONNX 模型 + 推理所需文件
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+TF_MODEL_DIR = PROJECT_ROOT / "models" / "tensorflow"
+ONNX_MODEL_DIR = PROJECT_ROOT / "models" / "onnx"
+
 # ---------- 配置 ----------
-ONNX_MODEL_PATH = "textcnn_classifier.onnx"
-TEXT_TOKENIZER_PATH = "text_tokenizer_none.pkl"
-FILENAME_TOKENIZER_PATH = "filename_tokenizer_none.pkl"
-CATEGORIES_PATH = "categories.pkl"
-CONFIG_PATH = "config_optimized.pkl"
+ONNX_MODEL_PATH = str(ONNX_MODEL_DIR / "textcnn_classifier.onnx")
+TEXT_TOKENIZER_PATH = str(ONNX_MODEL_DIR / "text_tokenizer_none.pkl")
+FILENAME_TOKENIZER_PATH = str(ONNX_MODEL_DIR / "filename_tokenizer_none.pkl")
+CATEGORIES_PATH = str(ONNX_MODEL_DIR / "categories.pkl")
+CONFIG_PATH = str(ONNX_MODEL_DIR / "config_optimized.pkl")
 
 # 模型词汇表大小（从错误信息确定：范围[-20000,19999]）
 # 有效索引范围: 0(Padding), 1-19999(词汇)

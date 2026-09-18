@@ -1,0 +1,77 @@
+# file_classifier_config.yaml
+# 文件分类器配置文件
+
+# 路径配置
+paths:
+  source_dir: "D:/Backup/桌面"            # 源文件夹路径
+  target_base_dir: "D:/Backup/桌面/课件"   # 目标基础文件夹路径
+  # 文件将移动到 target_base_dir/类别名/ 下
+
+# 预测配置
+prediction:
+  threshold: 0.98                        # 置信度阈值，低于此值不移动文件
+  verbose: true                          # 是否显示详细信息
+  supported_formats:                     # 支持的文件格式
+    - ".pptx"
+    - ".docx"
+
+# 文件处理配置
+file_handling:
+  move_files: true                       # true=移动文件, false=复制文件
+  create_category_dirs: true             # 是否自动创建类别目录
+  overwrite: false                       # 是否覆盖已存在的文件
+  keep_original_name: true               # 是否保持原文件名
+  conflict_resolution: "skip"            # 文件名冲突时: "rename" 或 "skip"
+
+# 分类配置
+categories:
+  target_categories: []                  # 需要处理的类别（空=所有类别）
+  exclude_categories: []                 # 需要排除的类别
+  low_confidence_action: "ignore"        # 未达阈值文件: "ignore" 或 "move_to_uncertain"
+  uncertain_folder_name: "_uncertain_low_confidence"
+
+# 临时文件清理配置
+temp_file_cleanup:
+  enabled: true                          # 是否启用临时文件清理
+  action: "delete"                       # 清理动作: 'delete' 或 'move'
+  target_dir: "./temp_cleanup"           # 移动模式下的目标目录
+  patterns:                              # 要清理的文件模式
+    - "~$*"                              # Office临时文件（~$开头）
+    - "*.tmp"                            # 临时文件
+    - "*~"                               # 备份文件
+    - "*.swp"                            # Vim临时文件
+    - "*.DS_Store"                       # macOS系统文件
+  min_file_age_minutes: 0                # 最小文件年龄(分钟)，0=不限制
+  clean_on_start: true                   # 处理前清理
+  clean_on_end: true                     # 处理后清理
+  dry_run: false                         # 试运行模式，不实际删除/移动
+  keep_empty_dirs: false                 # 清理后是否保留空目录
+
+# 🆕 重复文件处理配置
+duplicate_handling:
+  enabled: true                          # 是否启用重复文件检测
+  action: "delete"                       # 重复文件处理动作: 'delete'(删除), 'skip'(跳过), 'keep_both'(保留两者)
+  check_by_hash: true                    # 是否使用哈希值检测（推荐）
+  hash_algorithm: "md5"                  # 哈希算法: 'md5', 'sha1', 'sha256'
+  scan_all_files: true                   # 是否扫描所有文件检测重复（包括不同类别的）
+  delete_source_duplicate: true          # 是否删除源目录中的重复文件
+  dry_run: false                         # 试运行模式，不实际删除
+
+# 日志配置
+logging:
+  enabled: true                          # 是否启用日志
+  log_file: "file_mover.log"             # 日志文件路径
+  log_level: "INFO"                      # DEBUG, INFO, WARNING, ERROR
+  save_moved_list: true                  # 是否保存移动文件列表
+  moved_list_file: "moved_files.csv"
+  save_cleanup_list: true                # 是否保存临时文件清理记录
+  cleanup_list_file: "cleaned_files.csv"
+  save_duplicate_list: true              # 🆕 是否保存重复文件删除记录
+  duplicate_list_file: "duplicate_files.csv"
+
+# 高级选项
+advanced:
+  max_file_size_mb: 0                    # 最大文件大小限制(MB)，0=无限制
+  skip_empty_text: false                 # 是否跳过无法提取文本的文件
+  recursive_scan: false                  # 是否递归扫描子文件夹
+  skip_temp_files: true                  # 是否跳过临时文件

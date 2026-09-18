@@ -23,6 +23,8 @@ import os
 import re
 import pickle
 import json
+import shutil
+import argparse
 import random
 import zipfile
 from io import BytesIO
@@ -37,9 +39,10 @@ from sklearn.utils.class_weight import compute_class_weight
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
+import tensorflow as tf
 from tensorflow.keras.preprocessing.text import Tokenizer
 from tensorflow.keras.preprocessing.sequence import pad_sequences
-from tensorflow.keras.models import Model
+from tensorflow.keras.models import Model, load_model
 from tensorflow.keras.layers import Embedding, Conv1D, GlobalMaxPooling1D, Dense, Dropout, Input, Concatenate
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 from tensorflow.keras.utils import to_categorical
@@ -59,6 +62,24 @@ except ImportError:
 DATA_ROOT = "../data"
 CACHE_DIR = "../cache"
 CATEGORIES = ["语文", "数学", "英语", "物理", "化学", "生物", "班会"]
+
+# ========== 模型输出目录配置 ==========
+# 训练产物按框架分开放置：TensorFlow/Keras 与 ONNX 各自独立目录
+MODEL_ROOT_DIR = "models"                                     # 模型输出根目录
+TF_MODEL_DIR = os.path.join(MODEL_ROOT_DIR, "tensorflow")     # Keras 模型 + 训练产物
+ONNX_MODEL_DIR = os.path.join(MODEL_ROOT_DIR, "onnx")         # ONNX 模型 + 推理所需文件
+
+# ONNX 导出配置（训练结束后自动导出，一次性完成所有训练工作）
+ENABLE_ONNX_EXPORT = True     # 是否在训练结束后导出 ONNX（需要 tf2onnx + onnx）
+ONNX_OPSET = 13               # ONNX opset 版本
+
+# 供 ONNX 推理使用的文件（训练后自动从 TF_MODEL_DIR 复制到 ONNX_MODEL_DIR）
+ONNX_RUNTIME_FILES = [
+    "text_tokenizer_none.pkl",
+    "filename_tokenizer_none.pkl",
+    "categories.pkl",
+    "config_optimized.pkl",
+]
 
 # 🎯 指定只使用缓存的科目（跳过解析，仅从已有缓存读取）
 SKIP_CATEGORIES = []  # 例如: ["语文", "数学"] 表示语文和数学只从缓存读取
@@ -1245,7 +1266,15 @@ def build_optimized_multimodal_model(vocab_size, max_seq_len, max_filename_len,
     return model
 
 
-def save_tokenizers_without_keras(text_tokenizer, filename_tokenizer, categories, config):
+def ensure_model_dirs():
+    """创建模型输出目录（models/tensorflow 与 models/onnx）"""
+    os.makedirs(TF_MODEL_DIR, exist_ok=True)
+    os.makedirs(ONNX_MODEL_DIR, exist_ok=True)
+    return TF_MODEL_DIR, ONNX_MODEL_DIR
+
+
+def save_tokenizers_without_keras(text_tokenizer, filename_tokenizer, categories, config,
+                                  output_dir=TF_MODEL_DIR):
     """
     保存无Keras依赖的Tokenizer文件（用于推理）
     在20000词处截断（只保留前MAX_NB_WORDS个词）
@@ -1318,16 +1347,16 @@ def save_tokenizers_without_keras(text_tokenizer, filename_tokenizer, categories
     }
     
     # 保存文件
-    with open('text_tokenizer_none.pkl', 'wb') as f:
+    with open(os.path.join(output_dir, 'text_tokenizer_none.pkl'), 'wb') as f:
         pickle.dump(text_tokenizer_data, f)
-    print(f"\n✅ 已保存: text_tokenizer_none.pkl")
+    print(f"\n✅ 已保存: {os.path.join(output_dir, 'text_tokenizer_none.pkl')}")
     
-    with open('filename_tokenizer_none.pkl', 'wb') as f:
+    with open(os.path.join(output_dir, 'filename_tokenizer_none.pkl'), 'wb') as f:
         pickle.dump(filename_tokenizer_data, f)
-    print(f"✅ 已保存: filename_tokenizer_none.pkl")
+    print(f"✅ 已保存: {os.path.join(output_dir, 'filename_tokenizer_none.pkl')}")
     
     # 保存类别和配置
-    with open('categories.pkl', 'wb') as f:
+    with open(os.path.join(output_dir, 'categories.pkl'), 'wb') as f:
         pickle.dump(categories, f)
     
     # 更新配置，记录截断信息
@@ -1336,11 +1365,11 @@ def save_tokenizers_without_keras(text_tokenizer, filename_tokenizer, categories
     config['actual_text_vocab_size'] = actual_vocab_size
     config['actual_filename_vocab_size'] = actual_filename_vocab_size
     
-    with open('config_optimized.pkl', 'wb') as f:
+    with open(os.path.join(output_dir, 'config_optimized.pkl'), 'wb') as f:
         pickle.dump(config, f)
     
-    print(f"✅ 已保存: categories.pkl")
-    print(f"✅ 已保存: config_optimized.pkl")
+    print(f"✅ 已保存: {os.path.join(output_dir, 'categories.pkl')}")
+    print(f"✅ 已保存: {os.path.join(output_dir, 'config_optimized.pkl')}")
     
     # 打印汇总信息
     print("\n" + "="*50)
@@ -1353,7 +1382,7 @@ def save_tokenizers_without_keras(text_tokenizer, filename_tokenizer, categories
     return text_tokenizer_data, filename_tokenizer_data
 
 
-def save_json_vocabularies(text_tokenizer, filename_tokenizer):
+def save_json_vocabularies(text_tokenizer, filename_tokenizer, output_dir=TF_MODEL_DIR):
     """
     保存JSON格式的词表文件（截断在MAX_NB_WORDS和MAX_FILENAME_WORDS）
     便于外部工具读取和使用
@@ -1400,12 +1429,12 @@ def save_json_vocabularies(text_tokenizer, filename_tokenizer):
     
     text_vocab_json["vocabulary"].sort(key=lambda x: x["index"])
     
-    with open('text_vocabulary.json', 'w', encoding='utf-8') as f:
+    with open(os.path.join(output_dir, 'text_vocabulary.json'), 'w', encoding='utf-8') as f:
         json.dump(text_vocab_json, f, ensure_ascii=False, indent=2)
-    print(f"✅ 已保存: text_vocabulary.json")
+    print(f"✅ 已保存: {os.path.join(output_dir, 'text_vocabulary.json')}")
     print(f"   - 词表大小: {len(truncated_word_index)} 词")
     print(f"   - 原始大小: {len(full_word_index)} 词")
-    print(f"   - 文件大小: {os.path.getsize('text_vocabulary.json') / 1024:.1f} KB")
+    print(f"   - 文件大小: {os.path.getsize(os.path.join(output_dir, 'text_vocabulary.json')) / 1024:.1f} KB")
     
     # 简洁版本
     simple_text_vocab = {
@@ -1418,9 +1447,9 @@ def save_json_vocabularies(text_tokenizer, filename_tokenizer):
         "frequency_map": truncated_word_counts
     }
     
-    with open('text_vocabulary_simple.json', 'w', encoding='utf-8') as f:
+    with open(os.path.join(output_dir, 'text_vocabulary_simple.json'), 'w', encoding='utf-8') as f:
         json.dump(simple_text_vocab, f, ensure_ascii=False, indent=2)
-    print(f"✅ 已保存: text_vocabulary_simple.json")
+    print(f"✅ 已保存: {os.path.join(output_dir, 'text_vocabulary_simple.json')}")
     
     # ========== 2. 保存文件名词表 ==========
     full_filename_word_index = filename_tokenizer.word_index
@@ -1458,12 +1487,12 @@ def save_json_vocabularies(text_tokenizer, filename_tokenizer):
     
     filename_vocab_json["vocabulary"].sort(key=lambda x: x["index"])
     
-    with open('filename_vocabulary.json', 'w', encoding='utf-8') as f:
+    with open(os.path.join(output_dir, 'filename_vocabulary.json'), 'w', encoding='utf-8') as f:
         json.dump(filename_vocab_json, f, ensure_ascii=False, indent=2)
-    print(f"\n✅ 已保存: filename_vocabulary.json")
+    print(f"\n✅ 已保存: {os.path.join(output_dir, 'filename_vocabulary.json')}")
     print(f"   - 词表大小: {len(truncated_filename_word_index)} 词")
     print(f"   - 原始大小: {len(full_filename_word_index)} 词")
-    print(f"   - 文件大小: {os.path.getsize('filename_vocabulary.json') / 1024:.1f} KB")
+    print(f"   - 文件大小: {os.path.getsize(os.path.join(output_dir, 'filename_vocabulary.json')) / 1024:.1f} KB")
     
     # 简洁版本
     simple_filename_vocab = {
@@ -1476,9 +1505,9 @@ def save_json_vocabularies(text_tokenizer, filename_tokenizer):
         "frequency_map": truncated_filename_word_counts
     }
     
-    with open('filename_vocabulary_simple.json', 'w', encoding='utf-8') as f:
+    with open(os.path.join(output_dir, 'filename_vocabulary_simple.json'), 'w', encoding='utf-8') as f:
         json.dump(simple_filename_vocab, f, ensure_ascii=False, indent=2)
-    print(f"✅ 已保存: filename_vocabulary_simple.json")
+    print(f"✅ 已保存: {os.path.join(output_dir, 'filename_vocabulary_simple.json')}")
     
     # ========== 3. 保存词频统计报告 ==========
     word_frequencies = [(word, count) for word, count in truncated_word_counts.items()]
@@ -1529,9 +1558,9 @@ def save_json_vocabularies(text_tokenizer, filename_tokenizer):
         }
     }
     
-    with open('word_frequency_report.json', 'w', encoding='utf-8') as f:
+    with open(os.path.join(output_dir, 'word_frequency_report.json'), 'w', encoding='utf-8') as f:
         json.dump(word_frequency_report, f, ensure_ascii=False, indent=2)
-    print(f"\n✅ 已保存: word_frequency_report.json")
+    print(f"\n✅ 已保存: {os.path.join(output_dir, 'word_frequency_report.json')}")
     
     # ========== 4. 保存类别映射 ==========
     category_mapping = {
@@ -1545,12 +1574,13 @@ def save_json_vocabularies(text_tokenizer, filename_tokenizer):
         "category_to_index": {cat: i for i, cat in enumerate(CATEGORIES)}
     }
     
-    with open('category_mapping.json', 'w', encoding='utf-8') as f:
+    with open(os.path.join(output_dir, 'category_mapping.json'), 'w', encoding='utf-8') as f:
         json.dump(category_mapping, f, ensure_ascii=False, indent=2)
-    print(f"✅ 已保存: category_mapping.json")
+    print(f"✅ 已保存: {os.path.join(output_dir, 'category_mapping.json')}")
     
     print("\n" + "="*50)
     print("📊 JSON词表文件汇总:")
+    print(f"  输出目录: {output_dir}/")
     print(f"  文本词表 (完整): text_vocabulary.json ({len(truncated_word_index)} 词)")
     print(f"  文本词表 (简洁): text_vocabulary_simple.json")
     print(f"  文件名词表 (完整): filename_vocabulary.json ({len(truncated_filename_word_index)} 词)")
@@ -1560,6 +1590,131 @@ def save_json_vocabularies(text_tokenizer, filename_tokenizer):
     print("="*50)
     
     return True
+
+
+# ---------- ONNX 导出（已合并到训练流程） ----------
+def export_onnx_model(model, config, output_dir=ONNX_MODEL_DIR, opset=ONNX_OPSET,
+                      tf_model_dir=TF_MODEL_DIR, verify=True):
+    """
+    将训练好的 TextCNN 双输入模型导出为 ONNX（供 ONNX Runtime 推理使用）
+
+    参数:
+        model: 已训练的 Keras 模型
+        config: 训练配置字典（需包含 max_sequence_length / max_filename_length）
+        output_dir: ONNX 输出目录（默认 models/onnx）
+        opset: ONNX opset 版本
+        tf_model_dir: TensorFlow 产物目录（用于复制推理所需的 Tokenizer/类别/配置）
+        verify: 是否使用 onnxruntime 做一次前向校验
+
+    返回:
+        str | None: ONNX 模型路径，未导出时返回 None
+    """
+    print("\n" + "="*50)
+    print("步骤8: 导出ONNX模型")
+    print("="*50)
+
+    try:
+        import tf2onnx
+        import onnx
+    except ImportError as e:
+        print(f"⚠️  跳过ONNX导出: 缺少依赖 ({e})")
+        print("   如需自动导出ONNX，请先安装: pip install tf2onnx onnx")
+        return None
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    max_seq_len = config['max_sequence_length']
+    max_filename_len = config['max_filename_length']
+    onnx_path = os.path.join(output_dir, 'textcnn_classifier.onnx')
+
+    print(f"输入形状: text_input=(None, {max_seq_len}), filename_input=(None, {max_filename_len})")
+    print(f"输出路径: {onnx_path}")
+    print(f"opset版本: {opset}")
+
+    # 双输入模型必须显式指定输入签名
+    text_input_spec = tf.TensorSpec(shape=[None, max_seq_len], dtype=tf.int32, name='text_input')
+    filename_input_spec = tf.TensorSpec(shape=[None, max_filename_len], dtype=tf.int32, name='filename_input')
+
+    print("正在转换为ONNX格式...")
+    tf2onnx.convert.from_keras(
+        model,
+        input_signature=[text_input_spec, filename_input_spec],
+        opset=opset,
+        output_path=onnx_path
+    )
+
+    # 校验ONNX模型
+    onnx_model = onnx.load(onnx_path)
+    onnx.checker.check_model(onnx_model)
+    print("✅ ONNX模型校验通过")
+
+    print("\n模型输入:")
+    for inp in onnx_model.graph.input:
+        print(f"  - {inp.name}: {[d.dim_value for d in inp.type.tensor_type.shape.dim]}")
+
+    print("\n模型输出:")
+    for out in onnx_model.graph.output:
+        print(f"  - {out.name}: {[d.dim_value for d in out.type.tensor_type.shape.dim]}")
+
+    # 复制ONNX推理所需的Tokenizer/类别/配置，保证 models/onnx 可独立使用
+    print(f"\n复制推理所需文件到 {output_dir}/ ...")
+    for filename in ONNX_RUNTIME_FILES:
+        src = os.path.join(tf_model_dir, filename)
+        dst = os.path.join(output_dir, filename)
+        if os.path.exists(src):
+            shutil.copy2(src, dst)
+            print(f"  ✅ {filename}")
+        else:
+            print(f"  ⚠️  未找到 {src}，请检查TensorFlow产物目录")
+
+    # 可选：用onnxruntime做一次前向校验
+    if verify:
+        try:
+            import onnxruntime as ort
+
+            session = ort.InferenceSession(onnx_path, providers=['CPUExecutionProvider'])
+            dummy_text = np.zeros((1, max_seq_len), dtype=np.int32)
+            dummy_filename = np.zeros((1, max_filename_len), dtype=np.int32)
+            feed = {}
+            for inp in session.get_inputs():
+                feed[inp.name] = dummy_filename if 'filename' in inp.name.lower() else dummy_text
+            outputs = session.run(None, feed)
+            print(f"\n✅ ONNX Runtime 前向校验通过，输出形状: {outputs[0].shape}")
+        except ImportError:
+            print("\n⚠️  未安装 onnxruntime，跳过前向校验")
+        except Exception as e:
+            print(f"\n⚠️  ONNX Runtime 前向校验失败: {e}")
+
+    print(f"\n✅ ONNX模型已保存: {onnx_path}")
+    return onnx_path
+
+
+def export_onnx_from_saved(keras_path=None, config_path=None):
+    """
+    不重新训练，仅把已保存的Keras模型重新导出为ONNX
+
+    用法: python train.py --export-onnx-only
+    """
+    keras_path = keras_path or os.path.join(TF_MODEL_DIR, 'textcnn_optimized_classifier.keras')
+    config_path = config_path or os.path.join(TF_MODEL_DIR, 'config_optimized.pkl')
+
+    if not os.path.exists(keras_path):
+        print(f"❌ 未找到Keras模型: {keras_path}")
+        print("   请先运行 python train.py 完成训练")
+        return None
+
+    if not os.path.exists(config_path):
+        print(f"❌ 未找到训练配置: {config_path}")
+        return None
+
+    print(f"加载Keras模型: {keras_path}")
+    model = load_model(keras_path, compile=False)
+
+    print(f"加载训练配置: {config_path}")
+    with open(config_path, 'rb') as f:
+        config = pickle.load(f)
+
+    return export_onnx_model(model, config)
 
 
 # ---------- 主流程 ----------
@@ -1578,9 +1733,15 @@ def main():
     
     if SKIP_CATEGORIES:
         print(f"🎯 仅缓存模式科目: {', '.join(SKIP_CATEGORIES)}")
-    
+
+    # 模型输出目录（TensorFlow 与 ONNX 分开放置）
+    ensure_model_dirs()
+    print(f"模型输出目录:")
+    print(f"  - TensorFlow/Keras: {TF_MODEL_DIR}/")
+    print(f"  - ONNX:             {ONNX_MODEL_DIR}/")
+
     print("="*50)
-    
+
     if not os.path.exists(DATA_ROOT):
         print(f"错误: 数据目录不存在 '{DATA_ROOT}'")
         return
@@ -1705,7 +1866,7 @@ def main():
         min_delta=0.0001
     )
     checkpoint = ModelCheckpoint(
-        'best_model_optimized.keras', 
+        os.path.join(TF_MODEL_DIR, 'best_model_optimized.keras'),
         monitor='val_accuracy', 
         save_best_only=True, 
         mode='max'
@@ -1742,11 +1903,15 @@ def main():
     
     # 8. 保存模型和Tokenizer
     print("\n步骤7: 保存模型...")
-    model.save('textcnn_optimized_classifier.keras')
-    
-    with open('text_tokenizer.pkl', 'wb') as f:
+    keras_model_path = os.path.join(TF_MODEL_DIR, 'textcnn_optimized_classifier.keras')
+    model.save(keras_model_path)
+    print(f"✅ 已保存: {keras_model_path}")
+
+    full_text_tokenizer_path = os.path.join(TF_MODEL_DIR, 'text_tokenizer.pkl')
+    full_filename_tokenizer_path = os.path.join(TF_MODEL_DIR, 'filename_tokenizer.pkl')
+    with open(full_text_tokenizer_path, 'wb') as f:
         pickle.dump(text_tokenizer, f)
-    with open('filename_tokenizer.pkl', 'wb') as f:
+    with open(full_filename_tokenizer_path, 'wb') as f:
         pickle.dump(filename_tokenizer, f)
     
     config = {
@@ -1770,9 +1935,18 @@ def main():
     
     save_tokenizers_without_keras(text_tokenizer, filename_tokenizer, CATEGORIES, config)
     save_json_vocabularies(text_tokenizer, filename_tokenizer)
-    
+
+    # 9. 导出ONNX模型（转换已合并进训练流程，一次性完成所有训练工作）
+    onnx_path = None
+    if ENABLE_ONNX_EXPORT:
+        onnx_path = export_onnx_model(model, config)
+    else:
+        print("\n⏭️  已禁用ONNX导出（ENABLE_ONNX_EXPORT = False）")
+
     print("\n" + "="*50)
     print("训练完成！已保存以下文件:")
+
+    print(f"\n📦 TensorFlow/Keras 产物 ({TF_MODEL_DIR}/):")
     print("  - textcnn_optimized_classifier.keras")
     print("  - best_model_optimized.keras")
     print("  - text_tokenizer.pkl (完整版)")
@@ -1781,13 +1955,22 @@ def main():
     print("  - filename_tokenizer_none.pkl (无依赖版，截断)")
     print("  - categories.pkl")
     print("  - config_optimized.pkl")
-    print("\n📝 JSON词表文件:")
     print("  - text_vocabulary.json (完整文本词表)")
     print("  - text_vocabulary_simple.json (简洁文本词表)")
     print("  - filename_vocabulary.json (完整文件名词表)")
     print("  - filename_vocabulary_simple.json (简洁文件名词表)")
     print("  - word_frequency_report.json (词频统计报告)")
     print("  - category_mapping.json (类别映射)")
+    print("  - training_history.png (训练曲线)")
+
+    print(f"\n🚀 ONNX 推理产物 ({ONNX_MODEL_DIR}/):")
+    if onnx_path:
+        print("  - textcnn_classifier.onnx")
+        for name in ONNX_RUNTIME_FILES:
+            print(f"  - {name}")
+    else:
+        print("  ⚠️  未生成（缺少 tf2onnx/onnx 依赖，可运行: python train.py --export-onnx-only）")
+
     print(f"\n缓存目录: {CACHE_DIR}/")
     print(f"  - file_cache_{CACHE_VERSION}.json")
     print(f"  - cache_metadata_{CACHE_VERSION}.json")
@@ -1816,14 +1999,32 @@ def main():
         axes[1].legend()
         
         plt.tight_layout()
-        plt.savefig('training_history.png')
-        print("训练曲线已保存: training_history.png")
+        history_png = os.path.join(TF_MODEL_DIR, 'training_history.png')
+        plt.savefig(history_png)
+        print(f"训练曲线已保存: {history_png}")
         plt.close()
     except:
         pass
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="TextCNN 学科分类器训练脚本（训练 + 自动导出 ONNX）"
+    )
+    parser.add_argument("--export-onnx-only", action="store_true",
+                        help="不训练，仅把已保存的 Keras 模型重新导出为 ONNX")
+    parser.add_argument("--keras-model",
+                        default=os.path.join(TF_MODEL_DIR, "textcnn_optimized_classifier.keras"),
+                        help="--export-onnx-only 模式下要转换的 Keras 模型路径")
+    parser.add_argument("--config",
+                        default=os.path.join(TF_MODEL_DIR, "config_optimized.pkl"),
+                        help="--export-onnx-only 模式下使用的训练配置路径")
+    args = parser.parse_args()
+
     random.seed(42)
     np.random.seed(42)
-    main()
+
+    if args.export_onnx_only:
+        export_onnx_from_saved(keras_path=args.keras_model, config_path=args.config)
+    else:
+        main()

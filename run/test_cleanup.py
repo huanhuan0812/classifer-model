@@ -34,9 +34,9 @@ def create_test_files():
     print(f"\n测试目录: {test_dir}")
     print(f"包含 {len(test_files)} 个文件（其中5个是临时文件）")
     print("\n运行以下命令测试:")
-    print("1. 试运行模式: python file_mover.py --source ./test_cleanup --dry-run")
-    print("2. 实际清理: python file_mover.py --source ./test_cleanup --cleanup")
-    print("3. 移动模式: python file_mover.py --source ./test_cleanup --cleanup --cleanup-action move")
+    print("1. 试运行模式: python run/file_mover.py --source ./test_cleanup --dry-run")
+    print("2. 实际清理: python run/file_mover.py --source ./test_cleanup --cleanup")
+    print("3. 移动模式: python run/file_mover.py --source ./test_cleanup --cleanup --cleanup-action move")
 
 if __name__ == "__main__":
     create_test_files()

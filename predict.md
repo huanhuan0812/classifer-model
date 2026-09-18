@@ -33,17 +33,19 @@ print("所有依赖已安装")
 
 ### 2.3 所需模型文件
 
-使用本脚本前，请确保以下文件存在于当前目录（由 `train.py` 生成）：
+使用本脚本前，请确保以下文件存在于项目根目录的 `models/onnx/` 下
+（运行 `python train.py` 会自动生成并复制，无需手工转换）：
 
 | 文件名 | 说明 |
 |--------|------|
-| `textcnn_classifier.onnx` | ONNX 格式模型 |
+| `textcnn_classifier.onnx` | ONNX 格式模型（训练后自动导出） |
 | `text_tokenizer_none.pkl` | 文本分词器（无依赖版） |
 | `filename_tokenizer_none.pkl` | 文件名词典（无依赖版） |
 | `categories.pkl` | 类别映射 |
 | `config_optimized.pkl` | 训练配置 |
 
-> ⚠️ 注意：ONNX 模型需预先通过 `train.py` 转换或单独导出。
+> ⚠️ 注意：若模型缺失，可运行 `python train.py` 重新训练，
+> 或运行 `python train.py --export-onnx-only` 由已有的 Keras 模型重新导出 ONNX。
 
 ---
 
@@ -52,7 +54,7 @@ print("所有依赖已安装")
 ### 3.1 命令行参数
 
 ```bash
-python predict_onnx.py [选项] [输入路径]
+python run/predict_onnx.py [选项] [输入路径]
 ```
 
 | 参数 | 简写 | 说明 |
@@ -67,11 +69,11 @@ python predict_onnx.py [选项] [输入路径]
 #### ① 单文件预测
 
 ```bash
-python predict_onnx.py 语文.pptx
+python run/predict_onnx.py 语文.pptx
 ```
 
 ```bash
-python predict_onnx.py 数学.docx
+python run/predict_onnx.py 数学.docx
 ```
 
 输出示例：
@@ -97,7 +99,7 @@ python predict_onnx.py 数学.docx
 #### ② 交互式模式
 
 ```bash
-python predict_onnx.py -i
+python run/predict_onnx.py -i
 ```
 
 进入交互式界面后，每行输入一个文件路径即可预测。
@@ -105,13 +107,13 @@ python predict_onnx.py -i
 #### ③ 批量预测（单目录）
 
 ```bash
-python predict_onnx.py /path/to/files --batch
+python run/predict_onnx.py /path/to/files --batch
 ```
 
 #### ④ 批量预测（递归子目录）
 
 ```bash
-python predict_onnx.py /path/to/data --batch --recursive
+python run/predict_onnx.py /path/to/data --batch --recursive
 ```
 
 批量预测会生成 CSV 结果文件，格式如：
@@ -205,12 +207,17 @@ prediction_results_20260606_143022.csv
 
 ### Q1：提示 `textcnn_classifier.onnx` 文件不存在
 
-您需要先将 Keras 模型转换为 ONNX 格式。可以使用以下命令：
+ONNX 模型由训练脚本自动导出，无需单独转换。若 `models/onnx/` 下缺少模型，可执行：
 
 ```bash
-pip install tf2onnx
-python -m tf2onnx.convert --keras textcnn_optimized_classifier.keras --output textcnn_classifier.onnx
+# 方式一：重新训练（训练结束自动导出 ONNX）
+python train.py
+
+# 方式二：仅用已有的 Keras 模型重新导出 ONNX
+python train.py --export-onnx-only
 ```
+
+> 需要额外依赖：`pip install tf2onnx onnx`。
 
 ### Q2：提示索引超出范围（如索引 20000）
 
@@ -263,30 +270,31 @@ python -m tf2onnx.convert --keras textcnn_optimized_classifier.keras --output te
 
 ## 9. 与训练脚本的对应关系
 
-| 训练脚本输出 | 预测脚本使用 |
+| 训练脚本输出（`models/tensorflow/`） | 预测脚本使用（`models/onnx/`） |
 |--------------|--------------|
-| `textcnn_optimized_classifier.keras` | 需转换为 `textcnn_classifier.onnx` |
-| `text_tokenizer_none.pkl` | ✅ 直接使用 |
-| `filename_tokenizer_none.pkl` | ✅ 直接使用 |
-| `categories.pkl` | ✅ 直接使用 |
-| `config_optimized.pkl` | ✅ 读取配置（如序列长度） |
+| `textcnn_optimized_classifier.keras` | 训练结束时自动导出为 `textcnn_classifier.onnx` |
+| `text_tokenizer_none.pkl` | ✅ 自动复制后直接使用 |
+| `filename_tokenizer_none.pkl` | ✅ 自动复制后直接使用 |
+| `categories.pkl` | ✅ 自动复制后直接使用 |
+| `config_optimized.pkl` | ✅ 自动复制后读取配置（如序列长度） |
 
 ---
 
 ## 10. 完整示例流程
 
 
-1. 步骤1：训练模型（生成 .keras 和 tokenizer）
+1. 步骤1：训练模型（自动生成 .keras / tokenizer 并导出 ONNX）
 `python train.py`
 
-2. 步骤2：转换为 ONNX 格式
-[转换方法](./convert_to_onnx.md)
+2. 步骤2：确认 ONNX 产物
+`models/onnx/` 下应包含 `textcnn_classifier.onnx` 等文件
+（[ONNX 导出说明](./convert_to_onnx.md)）
 
-3. 步骤3：单文件预测
-`python predict_onnx.py 语文.pptx`
+3. 步骤3：单文件预测（在项目根目录执行）
+`python run/predict_onnx.py 语文.pptx`
 
 4. 步骤4：批量预测
-`python predict_onnx.py ./test_files --batch --recursive`
+`python run/predict_onnx.py ./test_files --batch --recursive`
 
 
 ---
@@ -300,6 +308,7 @@ python -m tf2onnx.convert --keras textcnn_optimized_classifier.keras --output te
 
 ---
 
-**版本**：v1.0（ONNX Runtime）  
-**兼容训练脚本版本**：v5  
+**版本**：v1.1（ONNX Runtime，脚本位于 `run/`，模型位于 `models/onnx/`）
+**兼容训练脚本版本**：v5
+**最后更新**：2026-09-18
 **最后更新**：2026-06-06

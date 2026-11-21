@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PPTX/PPT/DOCX学科分类器训练脚本 (TextCNN) - 优化版（缓存修复版）
+PPTX/PPT/DOCX学科分类器训练脚本 (TextCNN) - 优化版
 支持8类别：语文、数学、英语、物理、化学、生物、班会
 支持文件格式：.pptx, .ppt, .docx
 核心特性：
 1. 文本权重70%，文件名权重30%（增强文本重要性）
 2. 文件名数据增强（模拟不同命名习惯）
 3. 多尺度卷积提取文本特征（增加kernel_size=2）
-4. 🔥 文件解析缓存（立即保存，避免重复解析，大幅加速）
+4. 🔥 文件解析缓存（避免重复解析，大幅加速）
 5. 类别权重处理（解决小样本类别不平衡）
 6. 🎯 支持指定科目只使用缓存（跳过解析，仅从缓存读取）
 7. 👤 人名去除（在缓存阶段使用jieba识别并过滤人名）
@@ -16,15 +16,13 @@ PPTX/PPT/DOCX学科分类器训练脚本 (TextCNN) - 优化版（缓存修复版
 9. 💾 自动保存无依赖的Tokenizer（用于推理）
 10. 📝 输出JSON格式词表（便于外部工具使用）
 11. 📄 支持DOCX文件解析
-12. 🔍 增强缓存调试和验证
 """
 
 import os
 import re
+import sys
 import pickle
 import json
-import shutil
-import argparse
 import random
 import zipfile
 from io import BytesIO
@@ -39,10 +37,9 @@ from sklearn.utils.class_weight import compute_class_weight
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
-import tensorflow as tf
 from tensorflow.keras.preprocessing.text import Tokenizer
 from tensorflow.keras.preprocessing.sequence import pad_sequences
-from tensorflow.keras.models import Model, load_model
+from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Embedding, Conv1D, GlobalMaxPooling1D, Dense, Dropout, Input, Concatenate
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 from tensorflow.keras.utils import to_categorical
@@ -59,27 +56,9 @@ except ImportError:
     print("警告: python-docx未安装，docx文件支持将受限。请运行: pip install python-docx")
 
 # ========== 优化后的配置参数 ==========
-DATA_ROOT = "../data"
-CACHE_DIR = "../cache"
+DATA_ROOT = "../训练数据/data"
+CACHE_DIR = "../训练数据/cache"
 CATEGORIES = ["语文", "数学", "英语", "物理", "化学", "生物", "班会"]
-
-# ========== 模型输出目录配置 ==========
-# 训练产物按框架分开放置：TensorFlow/Keras 与 ONNX 各自独立目录
-MODEL_ROOT_DIR = "models"                                     # 模型输出根目录
-TF_MODEL_DIR = os.path.join(MODEL_ROOT_DIR, "tensorflow")     # Keras 模型 + 训练产物
-ONNX_MODEL_DIR = os.path.join(MODEL_ROOT_DIR, "onnx")         # ONNX 模型 + 推理所需文件
-
-# ONNX 导出配置（训练结束后自动导出，一次性完成所有训练工作）
-ENABLE_ONNX_EXPORT = True     # 是否在训练结束后导出 ONNX（需要 tf2onnx + onnx）
-ONNX_OPSET = 13               # ONNX opset 版本
-
-# 供 ONNX 推理使用的文件（训练后自动从 TF_MODEL_DIR 复制到 ONNX_MODEL_DIR）
-ONNX_RUNTIME_FILES = [
-    "text_tokenizer_none.pkl",
-    "filename_tokenizer_none.pkl",
-    "categories.pkl",
-    "config_optimized.pkl",
-]
 
 # 🎯 指定只使用缓存的科目（跳过解析，仅从已有缓存读取）
 SKIP_CATEGORIES = []  # 例如: ["语文", "数学"] 表示语文和数学只从缓存读取
@@ -114,7 +93,7 @@ CV_FOLDS = 5
 
 # 缓存配置
 ENABLE_CACHE = True
-CACHE_VERSION = "v6"          # 更新缓存版本（修复保存问题）
+CACHE_VERSION = "v5"          # 更新缓存版本（添加了DOCX支持）
 FORCE_REFRESH_CACHE = False
 
 # 类别权重配置
@@ -126,6 +105,32 @@ KEEP_SINGLE_CHAR_NAMES = False # 是否保留单字人名（通常单字可能�
 
 # 支持的文档格式
 SUPPORTED_EXTENSIONS = ['.pptx', '.ppt', '.docx', '.DOCX', '.PPTX', '.PPT']
+
+# ========== 训练产物输出配置 ==========
+# 所有训练产物（Keras模型、ONNX模型、Tokenizer、配置、词表等）统一输出到该目录，
+# 使项目根目录只保留训练代码。可通过环境变量 CLASSIFIER_OUTPUT_DIR 覆盖。
+OUTPUT_DIR = os.environ.get("CLASSIFIER_OUTPUT_DIR", "models")
+
+# ========== ONNX导出配置（训练结束后自动导出，无需手动运行转换脚本） ==========
+EXPORT_ONNX = True              # 训练完成后是否自动导出ONNX模型
+ONNX_OPSET = 13                 # ONNX opset 版本
+ONNX_MODEL_NAME = "textcnn_classifier.onnx"   # ONNX模型文件名（run/ 下的推理脚本默认加载）
+VERIFY_ONNX = True              # 是否校验ONNX模型（结构校验 + 与Keras输出的数值一致性）
+ONNX_VERIFY_SAMPLES = 8         # 数值一致性校验使用的测试样本数量
+ONNX_VERIFY_TIMEOUT = 300       # ONNX校验子进程超时时间（秒）
+
+
+def ensure_output_dir():
+    """确保训练产物输出目录存在"""
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    return OUTPUT_DIR
+
+
+def out_path(filename):
+    """获取训练产物的输出路径（统一放在 OUTPUT_DIR 下）"""
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    return os.path.join(OUTPUT_DIR, filename)
+
 
 # 停用词表
 STOPWORDS = set([
@@ -490,67 +495,27 @@ def extract_text_from_pptx(pptx_path, extract_embedded=True):
         return ""
 
 
-# ---------- 缓存管理类（增强版） ----------
+# ---------- 缓存管理类 ----------
 class FileCache:
-    """文件解析缓存管理器（支持立即保存、增强调试）"""
+    """文件解析缓存管理器（支持PPTX、DOCX）"""
     
     def __init__(self, cache_dir=CACHE_DIR, version=CACHE_VERSION):
         self.cache_dir = Path(cache_dir)
         self.version = version
         self.text_cache_file = self.cache_dir / f"file_cache_{version}.json"
         self.metadata_file = self.cache_dir / f"cache_metadata_{version}.json"
-        self.debug_file = self.cache_dir / f"cache_debug_{version}.log"
         
         # 创建缓存目录
-        try:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-            print(f"  📁 缓存目录: {self.cache_dir.absolute()}")
-        except Exception as e:
-            print(f"  ⚠️ 警告: 无法创建缓存目录 ({e})")
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
         
         # 加载现有缓存
         self.text_cache = self._load_cache()
         self.metadata = self._load_metadata()
         self._last_was_cache_hit = False
         
-        # 统计信息
+        # 统计人名去除情况
         self.names_removed_count = 0
         self.name_removal_stats = {}
-        self.cache_save_count = 0
-        self.cache_hit_count = 0
-        self.cache_miss_count = 0
-        
-        # 调试信息
-        self._debug_enabled = True
-        self._debug_log = []
-        
-        # 打印缓存状态
-        print(f"  📊 加载缓存: {len(self.text_cache)} 个文件")
-        non_empty = sum(1 for v in self.text_cache.values() if v)
-        if non_empty > 0:
-            print(f"  ✅ 非空条目: {non_empty}")
-        else:
-            print(f"  ⚠️  缓存为空或全是空内容")
-    
-    def _log_debug(self, msg):
-        """记录调试信息"""
-        if self._debug_enabled:
-            timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-            log_msg = f"[{timestamp}] {msg}"
-            self._debug_log.append(log_msg)
-            print(f"  🔍 {log_msg}")
-    
-    def _save_debug_log(self):
-        """保存调试日志到文件"""
-        try:
-            with open(self.debug_file, 'w', encoding='utf-8') as f:
-                f.write(f"缓存调试日志 - {datetime.now().isoformat()}\n")
-                f.write("="*50 + "\n")
-                for line in self._debug_log:
-                    f.write(line + "\n")
-            return True
-        except Exception as e:
-            return False
     
     def _get_file_hash(self, filepath):
         """计算文件的哈希值（用于检测文件是否变化）"""
@@ -571,19 +536,10 @@ class FileCache:
             try:
                 with open(self.text_cache_file, 'r', encoding='utf-8') as f:
                     cache = json.load(f)
+                print(f"  加载文件缓存: {len(cache)} 个文件")
                 return cache
-            except json.JSONDecodeError as e:
-                print(f"  ⚠️  警告: 缓存文件损坏 ({e})，将重新生成")
-                # 备份损坏的缓存
-                backup_file = self.text_cache_file.with_suffix('.json.bak')
-                try:
-                    self.text_cache_file.rename(backup_file)
-                    print(f"  📦 已备份损坏的缓存到: {backup_file}")
-                except:
-                    pass
-                return {}
             except Exception as e:
-                print(f"  ⚠️  警告: 加载缓存失败 ({e})，将重新生成")
+                print(f"  警告: 加载缓存失败 ({e})，将重新生成")
                 return {}
         return {}
     
@@ -601,76 +557,29 @@ class FileCache:
         return {}
     
     def _save_cache(self):
-        """保存缓存到磁盘（立即保存）"""
+        """保存缓存到磁盘"""
         if not ENABLE_CACHE:
             return
         
         try:
-            # 检查是否有内容
-            if not self.text_cache:
-                self._log_debug("⚠️  缓存为空，跳过保存")
-                return
-            
-            # 统计有效内容
-            total_entries = len(self.text_cache)
-            non_empty = sum(1 for v in self.text_cache.values() if v)
-            empty_entries = total_entries - non_empty
-            
-            self._log_debug(f"💾 准备保存: {total_entries} 个文件，{non_empty} 个非空，{empty_entries} 个空")
-            
-            if non_empty == 0:
-                self._log_debug("⚠️  没有非空内容，跳过保存")
-                return
-            
-            # 保存主缓存
             with open(self.text_cache_file, 'w', encoding='utf-8') as f:
                 json.dump(self.text_cache, f, ensure_ascii=False, indent=2)
-            
-            # 保存元数据
             with open(self.metadata_file, 'w', encoding='utf-8') as f:
                 json.dump(self.metadata, f, ensure_ascii=False, indent=2)
-            
-            self.cache_save_count += 1
-            
-            # 验证保存是否成功
-            if self.text_cache_file.exists():
-                file_size = self.text_cache_file.stat().st_size
-                self._log_debug(f"✅ 缓存已保存: {file_size} bytes")
-                
-                # 验证文件内容
-                try:
-                    with open(self.text_cache_file, 'r', encoding='utf-8') as f:
-                        verify_data = json.load(f)
-                        verify_count = len(verify_data)
-                        if verify_count == total_entries:
-                            self._log_debug(f"✅ 验证通过: {verify_count} 个条目")
-                        else:
-                            self._log_debug(f"⚠️  验证失败: 保存了 {verify_count} 个条目，期望 {total_entries}")
-                except Exception as e:
-                    self._log_debug(f"⚠️  验证失败: {e}")
-            else:
-                self._log_debug(f"❌ 缓存文件未创建!")
+            print(f"  缓存已保存: {len(self.text_cache)} 个文件")
             
             # 保存人名去除统计
-            if REMOVE_PERSON_NAMES and (self.names_removed_count > 0 or self.name_removal_stats):
-                stats_file = self.cache_dir / f"name_removal_stats_{self.version}.json"
-                with open(stats_file, 'w', encoding='utf-8') as f:
-                    json.dump({
-                        'names_removed_count': self.names_removed_count,
-                        'name_removal_stats': self.name_removal_stats,
-                        'removal_enabled': REMOVE_PERSON_NAMES,
-                        'cache_version': self.version,
-                        'total_files': len(self.text_cache)
-                    }, f, ensure_ascii=False, indent=2)
-                self._log_debug(f"✅ 人名去除统计已保存")
-                
-            # 保存调试日志
-            self._save_debug_log()
+            stats_file = self.cache_dir / f"name_removal_stats_{self.version}.json"
+            with open(stats_file, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'names_removed_count': self.names_removed_count,
+                    'name_removal_stats': self.name_removal_stats,
+                    'removal_enabled': REMOVE_PERSON_NAMES,
+                    'cache_version': self.version
+                }, f, ensure_ascii=False, indent=2)
                 
         except Exception as e:
-            self._log_debug(f"❌ 保存缓存失败: {e}")
-            import traceback
-            self._log_debug(traceback.format_exc())
+            print(f"  警告: 保存缓存失败 ({e})")
     
     def get(self, filepath):
         """获取缓存的文件内容"""
@@ -681,58 +590,27 @@ class FileCache:
         filepath = str(filepath)
         current_hash = self._get_file_hash(filepath)
         
-        self._log_debug(f"📖 get: {Path(filepath).name}")
-        self._log_debug(f"   - 在缓存中: {filepath in self.text_cache}")
-        
         if filepath in self.text_cache:
             cached_hash = self.metadata.get(filepath, {}).get('hash')
-            content = self.text_cache[filepath]
-            content_len = len(content) if content else 0
-            
-            self._log_debug(f"   - 内容长度: {content_len}")
-            self._log_debug(f"   - 哈希匹配: {cached_hash == current_hash}")
-            
             if cached_hash == current_hash:
                 self._last_was_cache_hit = True
-                self.cache_hit_count += 1
-                self._log_debug(f"   ✅ 缓存命中")
-                return content
-            else:
-                self._log_debug(f"   ⚠️  哈希不匹配，需要重新解析")
-        else:
-            self._log_debug(f"   ⚠️  不在缓存中")
+                return self.text_cache[filepath]
         
         self._last_was_cache_hit = False
-        self.cache_miss_count += 1
         return None
     
-    def set(self, filepath, text_content, force_save=False):
-        """
-        设置缓存并立即保存
-        
-        Args:
-            filepath: 文件路径
-            text_content: 文本内容
-            force_save: 是否强制保存（即使内容为空）
-        """
+    def set(self, filepath, text_content):
+        """设置缓存（在保存前应用人名去除）"""
         if not ENABLE_CACHE:
             return
         
         filepath = str(filepath)
-        original_len = len(text_content) if text_content else 0
-        
-        self._log_debug(f"💾 set: {Path(filepath).name}")
-        self._log_debug(f"   - 原始内容长度: {original_len}")
         
         # 在缓存阶段应用人名去除
         if REMOVE_PERSON_NAMES and text_content:
+            original_len = len(text_content)
             cleaned_content = remove_person_names_from_text(text_content)
-            cleaned_len = len(cleaned_content) if cleaned_content else 0
-            removed_count = original_len - cleaned_len
-            
-            self._log_debug(f"   - 人名去除后长度: {cleaned_len}")
-            if removed_count > 0:
-                self._log_debug(f"   - 去除字符数: {removed_count}")
+            removed_count = original_len - len(cleaned_content)
             
             if removed_count > 0:
                 self.names_removed_count += removed_count
@@ -741,31 +619,21 @@ class FileCache:
                 filename = Path(filepath).name
                 self.name_removal_stats[filename] = {
                     'original_length': original_len,
-                    'cleaned_length': cleaned_len,
+                    'cleaned_length': len(cleaned_content),
                     'removed_chars': removed_count,
                     'removal_ratio': removed_count / original_len if original_len > 0 else 0
                 }
             
             text_content = cleaned_content
-        elif not text_content and not force_save:
-            self._log_debug(f"   ⚠️  内容为空且未强制保存，跳过缓存")
-            return
         
-        # 更新缓存
-        self.text_cache[filepath] = text_content or ""
+        self.text_cache[filepath] = text_content
         self.metadata[filepath] = {
             'hash': self._get_file_hash(filepath),
             'cached_at': datetime.now().isoformat(),
             'file_size': Path(filepath).stat().st_size if Path(filepath).exists() else 0,
             'names_removed': REMOVE_PERSON_NAMES,
-            'file_type': Path(filepath).suffix.lower(),
-            'content_length': len(text_content) if text_content else 0
+            'file_type': Path(filepath).suffix.lower()
         }
-        
-        self._log_debug(f"   ✅ 缓存已更新")
-        
-        # 立即保存到磁盘
-        self._save_cache()
     
     def clear(self):
         """清空缓存"""
@@ -773,36 +641,24 @@ class FileCache:
         self.metadata = {}
         self.names_removed_count = 0
         self.name_removal_stats = {}
-        self.cache_save_count = 0
-        
         if self.text_cache_file.exists():
             self.text_cache_file.unlink()
         if self.metadata_file.exists():
             self.metadata_file.unlink()
-        
-        self._log_debug("🗑️  缓存已清空")
-        print("  ✅ 缓存已清空")
+        print("  缓存已清空")
     
     def save(self):
-        """保存缓存（兼容旧接口）"""
+        """保存缓存"""
         self._save_cache()
     
     def get_stats(self):
         """获取缓存统计信息"""
-        total_entries = len(self.text_cache)
-        non_empty = sum(1 for v in self.text_cache.values() if v)
-        
         return {
-            'cached_files': total_entries,
-            'non_empty': non_empty,
-            'empty_entries': total_entries - non_empty,
+            'cached_files': len(self.text_cache),
             'cache_file_size': self.text_cache_file.stat().st_size if self.text_cache_file.exists() else 0,
             'metadata_file_size': self.metadata_file.stat().st_size if self.metadata_file.exists() else 0,
             'names_removed_total': self.names_removed_count,
-            'files_with_names_removed': len(self.name_removal_stats),
-            'cache_save_count': self.cache_save_count,
-            'cache_hit_count': self.cache_hit_count,
-            'cache_miss_count': self.cache_miss_count
+            'files_with_names_removed': len(self.name_removal_stats)
         }
     
     def has_cache(self, filepath):
@@ -821,10 +677,10 @@ class FileCache:
     def print_name_removal_summary(self):
         """打印人名去除摘要"""
         if not REMOVE_PERSON_NAMES:
-            print("\n👤 人名去除: 已禁用")
+            print("\n人名去除: 已禁用")
             return
         
-        print(f"\n👤 人名去除统计:")
+        print(f"\n人名去除统计:")
         print(f"  总共去除字符数: {self.names_removed_count}")
         print(f"  涉及文件数: {len(self.name_removal_stats)}")
         
@@ -840,17 +696,6 @@ class FileCache:
                 print(f"  去除最多人名的文件:")
                 for filename, stats in sorted_files:
                     print(f"    - {filename[:40]}: 去除 {stats['removed_chars']} 字符 ({stats['removal_ratio']*100:.1f}%)")
-    
-    def print_cache_summary(self):
-        """打印缓存摘要"""
-        stats = self.get_stats()
-        print(f"\n📊 缓存摘要:")
-        print(f"  总缓存条目: {stats['cached_files']}")
-        print(f"  非空条目: {stats['non_empty']}")
-        print(f"  空条目: {stats['empty_entries']}")
-        print(f"  缓存命中: {stats['cache_hit_count']}")
-        print(f"  缓存未命中: {stats['cache_miss_count']}")
-        print(f"  保存次数: {stats['cache_save_count']}")
 
 
 # 全局缓存实例
@@ -944,41 +789,19 @@ def cut_words(text):
 
 
 def process_file(filepath, cat, label_idx, stats, skip_parsing=False):
-    """处理单个文件（支持PPTX、DOCX）- 立即缓存"""
-    cache = get_cache()
-    filepath_str = str(filepath)
-    
-    filename_raw, original_filename = extract_filename_features(filepath_str)
+    """处理单个文件（支持PPTX、DOCX）"""
+    filename_raw, original_filename = extract_filename_features(str(filepath))
     filename_processed = process_filename_text(filename_raw)
     
-    # 检查缓存
-    cached_text = cache.get(filepath_str)
-    
-    if cached_text is not None and not skip_parsing:
-        # 缓存命中，直接使用缓存内容
-        raw_text = cached_text
-        stats['cache_hits'] += 1
-        stats['cache_used'] += 1
-    elif skip_parsing:
-        # 跳过解析模式，必须从缓存读取
+    if skip_parsing:
+        cache = get_cache()
+        cached_text = cache.get(str(filepath))
         if cached_text is None:
             stats['cache_missing_skip'] += 1
             return None, None, None, False
         raw_text = cached_text
-        stats['cache_used'] += 1
     else:
-        # 缓存未命中，解析文件
-        raw_text = extract_text_from_file(filepath_str)
-        stats['cache_misses'] += 1
-        
-        # 立即保存到缓存（即使内容为空也保存，避免重复解析失败）
-        if raw_text:
-            cache.set(filepath_str, raw_text)
-            stats['cache_saved'] += 1
-        else:
-            # 对于空内容，也保存空字符串，避免重复尝试解析
-            cache.set(filepath_str, "", force_save=True)
-            stats['cache_saved_empty'] += 1
+        raw_text = extract_text_from_file(str(filepath))
     
     # 注意：raw_text 已经从缓存中获取，且已经在缓存阶段去除了人名
     
@@ -1014,7 +837,7 @@ def extract_filename_features(filepath):
 
 
 def load_data_with_cache(data_root):
-    """带缓存的加载函数（支持PPTX和DOCX，立即保存缓存）"""
+    """带缓存的加载函数（支持PPTX和DOCX）"""
     texts = []
     filenames = []
     labels = []
@@ -1030,9 +853,6 @@ def load_data_with_cache(data_root):
         'success': 0,
         'cache_hits': 0,
         'cache_misses': 0,
-        'cache_used': 0,
-        'cache_saved': 0,
-        'cache_saved_empty': 0,
         'cache_missing_skip': 0,
         'skipped_categories': 0,
         'by_category': {},
@@ -1116,6 +936,12 @@ def load_data_with_cache(data_root):
                     print(f"  ... 已处理 {idx + 1}/{len(files)} 个文件")
                 continue
             
+            if hasattr(cache, '_last_was_cache_hit'):
+                if cache._last_was_cache_hit:
+                    stats['cache_hits'] += 1
+                else:
+                    stats['cache_misses'] += 1
+            
             filename_variants = [filename_processed]
             if ENABLE_FILENAME_AUGMENTATION and filename_processed:
                 augmented_variants = augment_filename(original_filename)
@@ -1141,9 +967,6 @@ def load_data_with_cache(data_root):
             
             if (idx + 1) % 20 == 0:
                 print(f"  ... 已处理 {idx + 1}/{len(files)} 个文件")
-                # 每处理20个文件，显示一次缓存状态
-                cache_stats = cache.get_stats()
-                print(f"     缓存: {cache_stats['cached_files']} 个文件, {cache_stats['non_empty']} 非空")
         
         cat_stats = stats['by_category'][cat]
         if skip_parsing:
@@ -1167,13 +990,6 @@ def print_stats(stats):
     if stats['success'] > 0:
         print(f"  └─ 增强比例:   {stats['augmented_count']/stats['success']*100:.1f}%")
     
-    print(f"\n缓存统计:")
-    print(f"  缓存命中:      {stats.get('cache_hits', 0)}")
-    print(f"  缓存未命中:    {stats.get('cache_misses', 0)}")
-    print(f"  缓存使用:      {stats.get('cache_used', 0)}")
-    print(f"  缓存保存:      {stats.get('cache_saved', 0)}")
-    print(f"  缓存保存空:    {stats.get('cache_saved_empty', 0)}")
-    
     if stats.get('cache_missing_skip', 0) > 0:
         print(f"\n⚠️  跳过解析模式中因缓存缺失跳过的文件: {stats['cache_missing_skip']}")
     
@@ -1190,11 +1006,10 @@ def print_stats(stats):
     
     cache = get_cache()
     cache_stats = cache.get_stats()
-    print(f"\n缓存详细统计:")
-    print(f"  总缓存条目:    {cache_stats['cached_files']}")
-    print(f"  非空条目:      {cache_stats['non_empty']}")
-    print(f"  空条目:        {cache_stats['empty_entries']}")
-    print(f"  缓存文件大小:  {cache_stats['cache_file_size'] / 1024:.1f} KB")
+    print(f"\n缓存统计:")
+    print(f"  缓存文件数:    {cache_stats['cached_files']}")
+    print(f"  缓存命中:      {stats.get('cache_hits', 0)}")
+    print(f"  缓存未命中:    {stats.get('cache_misses', 0)}")
     
     # 打印人名去除统计
     if REMOVE_PERSON_NAMES:
@@ -1266,15 +1081,235 @@ def build_optimized_multimodal_model(vocab_size, max_seq_len, max_filename_len,
     return model
 
 
-def ensure_model_dirs():
-    """创建模型输出目录（models/tensorflow 与 models/onnx）"""
-    os.makedirs(TF_MODEL_DIR, exist_ok=True)
-    os.makedirs(ONNX_MODEL_DIR, exist_ok=True)
-    return TF_MODEL_DIR, ONNX_MODEL_DIR
+# ONNX校验子进程代码（只依赖 onnx / onnxruntime / numpy，不加载TensorFlow，
+# 因此不会与训练进程中的 TensorFlow 产生冲突；输出为 ASCII 键值行，便于父进程解析）
+_ONNX_VERIFY_CODE = r'''
+import sys
+import numpy as np
+import onnx
+import onnxruntime as ort
+
+onnx_path, data_path = sys.argv[1], sys.argv[2]
+
+model = onnx.load(onnx_path)
+onnx.checker.check_model(model)
+print("CHECKER=OK")
+
+for inp in model.graph.input:
+    dims = ",".join(str(d.dim_value) for d in inp.type.tensor_type.shape.dim)
+    print("INPUT=%s;%s" % (inp.name, dims))
+for out in model.graph.output:
+    dims = ",".join(str(d.dim_value) for d in out.type.tensor_type.shape.dim)
+    print("OUTPUT=%s;%s" % (out.name, dims))
+
+data = np.load(data_path)
+text = data["text"]
+filename = data["filename"]
+keras_probs = data["keras_probs"]
+
+session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+feeds = {}
+for inp in session.get_inputs():
+    feeds[inp.name] = filename if "filename" in inp.name else text
+onnx_probs = session.run(None, feeds)[0]
+
+print("SAMPLES=%d" % len(text))
+print("MAX_DIFF=%.9e" % float(np.max(np.abs(keras_probs - onnx_probs))))
+print("SAME_LABELS=%d" % int(np.array_equal(np.argmax(keras_probs, axis=1),
+                                           np.argmax(onnx_probs, axis=1))))
+'''
 
 
-def save_tokenizers_without_keras(text_tokenizer, filename_tokenizer, categories, config,
-                                  output_dir=TF_MODEL_DIR):
+def verify_onnx_in_subprocess(onnx_path, text_samples, filename_samples, keras_probs):
+    """
+    在独立子进程中校验ONNX模型：结构校验 + 与Keras输出的数值一致性
+
+    说明：onnx / onnxruntime 与 TensorFlow 在同一进程内混用时，
+    部分环境下会出现进程级崩溃（没有Python异常栈），为避免训练流程
+    在最后一步意外中断，这里统一放到子进程中校验；子进程只依赖
+    onnx / onnxruntime / numpy，不加载TensorFlow。
+
+    Args:
+        onnx_path: ONNX模型路径
+        text_samples: 文本序列样本（numpy数组）
+        filename_samples: 文件名序列样本（numpy数组）
+        keras_probs: 上述样本在Keras模型上的输出
+
+    Returns:
+        bool: 是否校验通过（依赖缺失或子进程异常时返回False）
+    """
+    import subprocess
+    import tempfile
+
+    work_dir = tempfile.mkdtemp(prefix="onnx_verify_")
+    data_path = os.path.join(work_dir, "onnx_verify_data.npz")
+    np.savez(
+        data_path,
+        text=np.asarray(text_samples, dtype=np.int32),
+        filename=np.asarray(filename_samples, dtype=np.int32),
+        keras_probs=np.asarray(keras_probs, dtype=np.float32)
+    )
+
+    env = os.environ.copy()
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.setdefault("PYTHONUTF8", "1")
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _ONNX_VERIFY_CODE, onnx_path, data_path],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=env, timeout=ONNX_VERIFY_TIMEOUT
+        )
+    except subprocess.TimeoutExpired:
+        print(f"⚠️  ONNX校验子进程超时（{ONNX_VERIFY_TIMEOUT}秒），跳过校验")
+        return False
+    except Exception as e:
+        print(f"⚠️  ONNX校验子进程启动失败: {e}")
+        return False
+    finally:
+        try:
+            os.remove(data_path)
+            os.rmdir(work_dir)
+        except Exception:
+            pass
+
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        if "ModuleNotFoundError" in stderr:
+            print("⚠️  未安装 onnx / onnxruntime，跳过ONNX校验")
+            print("   如需校验请安装: pip install onnx onnxruntime")
+        else:
+            print(f"⚠️  ONNX校验子进程异常退出（code={proc.returncode}）")
+            if stderr:
+                print(f"    {stderr.splitlines()[-1]}")
+        return False
+
+    # ========== 解析子进程输出 ==========
+    checker_ok = False
+    graph_inputs, graph_outputs = [], []
+    samples = 0
+    max_diff = None
+    same_labels = False
+
+    for line in (proc.stdout or "").splitlines():
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if key == "CHECKER":
+            checker_ok = (value == "OK")
+        elif key in ("INPUT", "OUTPUT"):
+            name, _, dims = value.partition(";")
+            (graph_inputs if key == "INPUT" else graph_outputs).append((name, dims))
+        elif key == "SAMPLES":
+            samples = int(value)
+        elif key == "MAX_DIFF":
+            max_diff = float(value)
+        elif key == "SAME_LABELS":
+            same_labels = (value == "1")
+
+    if not checker_ok:
+        print("⚠️  ONNX结构校验未通过")
+        return False
+
+    print("✅ ONNX结构校验通过 (onnx.checker)")
+    if graph_inputs:
+        print("  模型输入:")
+        for name, dims in graph_inputs:
+            print(f"    - {name}: [{dims}]")
+    if graph_outputs:
+        print("  模型输出:")
+        for name, dims in graph_outputs:
+            print(f"    - {name}: [{dims}]")
+
+    if max_diff is None:
+        print("⚠️  未获取到数值一致性校验结果")
+        return False
+
+    print(f"\n  数值一致性校验（{samples}个测试样本）:")
+    print(f"    - Keras与ONNX输出最大差异: {max_diff:.3e}")
+    print(f"    - 预测类别一致: {'✅ 是' if same_labels else '❌ 否'}")
+    if max_diff < 1e-4 and same_labels:
+        print("✅ 数值一致性校验通过")
+        return True
+
+    print("⚠️  Keras与ONNX输出存在差异，请检查ONNX模型")
+    return False
+
+
+def export_onnx_model(model, output_path=None, max_seq_len=MAX_SEQUENCE_LENGTH,
+                      max_filename_len=MAX_FILENAME_LENGTH, opset=ONNX_OPSET,
+                      verify_samples=None, verify=VERIFY_ONNX):
+    """
+    将训练得到的Keras模型导出为ONNX格式（双输入：文本序列 + 文件名序列）
+
+    在训练流程内部自动调用，因此无需再手动运行转换脚本。
+
+    Args:
+        model: 训练完成的Keras模型
+        output_path: ONNX输出路径，默认 OUTPUT_DIR/textcnn_classifier.onnx
+        max_seq_len: 文本序列长度
+        max_filename_len: 文件名序列长度
+        opset: ONNX opset版本
+        verify_samples: (text_sequences, filename_sequences) 用于数值一致性校验
+        verify: 是否进行校验
+
+    Returns:
+        str: ONNX文件路径；导出失败时返回None
+    """
+    print("\n" + "="*50)
+    print("步骤8: 导出ONNX模型（供 run/ 目录下的推理脚本使用）")
+    print("="*50)
+    
+    if output_path is None:
+        output_path = out_path(ONNX_MODEL_NAME)
+    
+    try:
+        import tensorflow as tf
+        import tf2onnx
+    except ImportError as e:
+        print(f"⚠️  跳过ONNX导出: 缺少依赖 ({e})")
+        print("   如需自动导出请安装: pip install tf2onnx onnx onnxruntime")
+        return None
+    
+    # 指定双输入签名（文本序列 + 文件名序列）
+    text_input = tf.TensorSpec(shape=[None, max_seq_len], dtype=tf.int32, name='text_input')
+    filename_input = tf.TensorSpec(shape=[None, max_filename_len], dtype=tf.int32, name='filename_input')
+    
+    print(f"  输入签名: text_input=(None, {max_seq_len}), filename_input=(None, {max_filename_len})")
+    print(f"  opset: {opset}")
+    print("  正在转换 Keras → ONNX ...")
+    
+    try:
+        tf2onnx.convert.from_keras(
+            model,
+            input_signature=[text_input, filename_input],
+            opset=opset,
+            output_path=output_path
+        )
+    except Exception as e:
+        print(f"❌ ONNX导出失败: {e}")
+        print("   可稍后运行 run/convert_to_onnx.py 手动导出")
+        return None
+    
+    print(f"✅ ONNX模型已保存: {output_path}")
+    
+    if not verify or verify_samples is None:
+        return output_path
+    
+    # ========== 结构校验 + 数值一致性校验（子进程执行，避免与TF冲突） ==========
+    try:
+        text_samples, filename_samples = verify_samples
+        print("\n  正在校验ONNX模型 ...")
+        keras_probs = model.predict([text_samples, filename_samples], verbose=0)
+        verify_onnx_in_subprocess(output_path, text_samples, filename_samples, keras_probs)
+    except Exception as e:
+        print(f"⚠️  ONNX校验跳过: {e}")
+    
+    return output_path
+
+
+def save_tokenizers_without_keras(text_tokenizer, filename_tokenizer, categories, config):
     """
     保存无Keras依赖的Tokenizer文件（用于推理）
     在20000词处截断（只保留前MAX_NB_WORDS个词）
@@ -1346,17 +1381,21 @@ def save_tokenizers_without_keras(text_tokenizer, filename_tokenizer, categories
         'original_vocab_size': full_filename_vocab_size
     }
     
-    # 保存文件
-    with open(os.path.join(output_dir, 'text_tokenizer_none.pkl'), 'wb') as f:
-        pickle.dump(text_tokenizer_data, f)
-    print(f"\n✅ 已保存: {os.path.join(output_dir, 'text_tokenizer_none.pkl')}")
+    # 保存文件（统一输出到 OUTPUT_DIR）
+    text_tokenizer_file = out_path('text_tokenizer_none.pkl')
+    filename_tokenizer_file = out_path('filename_tokenizer_none.pkl')
+    categories_file = out_path('categories.pkl')
     
-    with open(os.path.join(output_dir, 'filename_tokenizer_none.pkl'), 'wb') as f:
+    with open(text_tokenizer_file, 'wb') as f:
+        pickle.dump(text_tokenizer_data, f)
+    print(f"\n✅ 已保存: {text_tokenizer_file}")
+    
+    with open(filename_tokenizer_file, 'wb') as f:
         pickle.dump(filename_tokenizer_data, f)
-    print(f"✅ 已保存: {os.path.join(output_dir, 'filename_tokenizer_none.pkl')}")
+    print(f"✅ 已保存: {filename_tokenizer_file}")
     
     # 保存类别和配置
-    with open(os.path.join(output_dir, 'categories.pkl'), 'wb') as f:
+    with open(categories_file, 'wb') as f:
         pickle.dump(categories, f)
     
     # 更新配置，记录截断信息
@@ -1365,11 +1404,12 @@ def save_tokenizers_without_keras(text_tokenizer, filename_tokenizer, categories
     config['actual_text_vocab_size'] = actual_vocab_size
     config['actual_filename_vocab_size'] = actual_filename_vocab_size
     
-    with open(os.path.join(output_dir, 'config_optimized.pkl'), 'wb') as f:
+    config_file = out_path('config_optimized.pkl')
+    with open(config_file, 'wb') as f:
         pickle.dump(config, f)
     
-    print(f"✅ 已保存: {os.path.join(output_dir, 'categories.pkl')}")
-    print(f"✅ 已保存: {os.path.join(output_dir, 'config_optimized.pkl')}")
+    print(f"✅ 已保存: {categories_file}")
+    print(f"✅ 已保存: {config_file}")
     
     # 打印汇总信息
     print("\n" + "="*50)
@@ -1382,7 +1422,7 @@ def save_tokenizers_without_keras(text_tokenizer, filename_tokenizer, categories
     return text_tokenizer_data, filename_tokenizer_data
 
 
-def save_json_vocabularies(text_tokenizer, filename_tokenizer, output_dir=TF_MODEL_DIR):
+def save_json_vocabularies(text_tokenizer, filename_tokenizer):
     """
     保存JSON格式的词表文件（截断在MAX_NB_WORDS和MAX_FILENAME_WORDS）
     便于外部工具读取和使用
@@ -1429,12 +1469,13 @@ def save_json_vocabularies(text_tokenizer, filename_tokenizer, output_dir=TF_MOD
     
     text_vocab_json["vocabulary"].sort(key=lambda x: x["index"])
     
-    with open(os.path.join(output_dir, 'text_vocabulary.json'), 'w', encoding='utf-8') as f:
+    text_vocab_file = out_path('text_vocabulary.json')
+    with open(text_vocab_file, 'w', encoding='utf-8') as f:
         json.dump(text_vocab_json, f, ensure_ascii=False, indent=2)
-    print(f"✅ 已保存: {os.path.join(output_dir, 'text_vocabulary.json')}")
+    print(f"✅ 已保存: {text_vocab_file}")
     print(f"   - 词表大小: {len(truncated_word_index)} 词")
     print(f"   - 原始大小: {len(full_word_index)} 词")
-    print(f"   - 文件大小: {os.path.getsize(os.path.join(output_dir, 'text_vocabulary.json')) / 1024:.1f} KB")
+    print(f"   - 文件大小: {os.path.getsize(text_vocab_file) / 1024:.1f} KB")
     
     # 简洁版本
     simple_text_vocab = {
@@ -1447,9 +1488,10 @@ def save_json_vocabularies(text_tokenizer, filename_tokenizer, output_dir=TF_MOD
         "frequency_map": truncated_word_counts
     }
     
-    with open(os.path.join(output_dir, 'text_vocabulary_simple.json'), 'w', encoding='utf-8') as f:
+    simple_text_vocab_file = out_path('text_vocabulary_simple.json')
+    with open(simple_text_vocab_file, 'w', encoding='utf-8') as f:
         json.dump(simple_text_vocab, f, ensure_ascii=False, indent=2)
-    print(f"✅ 已保存: {os.path.join(output_dir, 'text_vocabulary_simple.json')}")
+    print(f"✅ 已保存: {simple_text_vocab_file}")
     
     # ========== 2. 保存文件名词表 ==========
     full_filename_word_index = filename_tokenizer.word_index
@@ -1487,12 +1529,13 @@ def save_json_vocabularies(text_tokenizer, filename_tokenizer, output_dir=TF_MOD
     
     filename_vocab_json["vocabulary"].sort(key=lambda x: x["index"])
     
-    with open(os.path.join(output_dir, 'filename_vocabulary.json'), 'w', encoding='utf-8') as f:
+    filename_vocab_file = out_path('filename_vocabulary.json')
+    with open(filename_vocab_file, 'w', encoding='utf-8') as f:
         json.dump(filename_vocab_json, f, ensure_ascii=False, indent=2)
-    print(f"\n✅ 已保存: {os.path.join(output_dir, 'filename_vocabulary.json')}")
+    print(f"\n✅ 已保存: {filename_vocab_file}")
     print(f"   - 词表大小: {len(truncated_filename_word_index)} 词")
     print(f"   - 原始大小: {len(full_filename_word_index)} 词")
-    print(f"   - 文件大小: {os.path.getsize(os.path.join(output_dir, 'filename_vocabulary.json')) / 1024:.1f} KB")
+    print(f"   - 文件大小: {os.path.getsize(filename_vocab_file) / 1024:.1f} KB")
     
     # 简洁版本
     simple_filename_vocab = {
@@ -1505,9 +1548,10 @@ def save_json_vocabularies(text_tokenizer, filename_tokenizer, output_dir=TF_MOD
         "frequency_map": truncated_filename_word_counts
     }
     
-    with open(os.path.join(output_dir, 'filename_vocabulary_simple.json'), 'w', encoding='utf-8') as f:
+    simple_filename_vocab_file = out_path('filename_vocabulary_simple.json')
+    with open(simple_filename_vocab_file, 'w', encoding='utf-8') as f:
         json.dump(simple_filename_vocab, f, ensure_ascii=False, indent=2)
-    print(f"✅ 已保存: {os.path.join(output_dir, 'filename_vocabulary_simple.json')}")
+    print(f"✅ 已保存: {simple_filename_vocab_file}")
     
     # ========== 3. 保存词频统计报告 ==========
     word_frequencies = [(word, count) for word, count in truncated_word_counts.items()]
@@ -1558,9 +1602,10 @@ def save_json_vocabularies(text_tokenizer, filename_tokenizer, output_dir=TF_MOD
         }
     }
     
-    with open(os.path.join(output_dir, 'word_frequency_report.json'), 'w', encoding='utf-8') as f:
+    freq_report_file = out_path('word_frequency_report.json')
+    with open(freq_report_file, 'w', encoding='utf-8') as f:
         json.dump(word_frequency_report, f, ensure_ascii=False, indent=2)
-    print(f"\n✅ 已保存: {os.path.join(output_dir, 'word_frequency_report.json')}")
+    print(f"\n✅ 已保存: {freq_report_file}")
     
     # ========== 4. 保存类别映射 ==========
     category_mapping = {
@@ -1574,13 +1619,13 @@ def save_json_vocabularies(text_tokenizer, filename_tokenizer, output_dir=TF_MOD
         "category_to_index": {cat: i for i, cat in enumerate(CATEGORIES)}
     }
     
-    with open(os.path.join(output_dir, 'category_mapping.json'), 'w', encoding='utf-8') as f:
+    category_mapping_file = out_path('category_mapping.json')
+    with open(category_mapping_file, 'w', encoding='utf-8') as f:
         json.dump(category_mapping, f, ensure_ascii=False, indent=2)
-    print(f"✅ 已保存: {os.path.join(output_dir, 'category_mapping.json')}")
+    print(f"✅ 已保存: {category_mapping_file}")
     
     print("\n" + "="*50)
     print("📊 JSON词表文件汇总:")
-    print(f"  输出目录: {output_dir}/")
     print(f"  文本词表 (完整): text_vocabulary.json ({len(truncated_word_index)} 词)")
     print(f"  文本词表 (简洁): text_vocabulary_simple.json")
     print(f"  文件名词表 (完整): filename_vocabulary.json ({len(truncated_filename_word_index)} 词)")
@@ -1592,135 +1637,13 @@ def save_json_vocabularies(text_tokenizer, filename_tokenizer, output_dir=TF_MOD
     return True
 
 
-# ---------- ONNX 导出（已合并到训练流程） ----------
-def export_onnx_model(model, config, output_dir=ONNX_MODEL_DIR, opset=ONNX_OPSET,
-                      tf_model_dir=TF_MODEL_DIR, verify=True):
-    """
-    将训练好的 TextCNN 双输入模型导出为 ONNX（供 ONNX Runtime 推理使用）
-
-    参数:
-        model: 已训练的 Keras 模型
-        config: 训练配置字典（需包含 max_sequence_length / max_filename_length）
-        output_dir: ONNX 输出目录（默认 models/onnx）
-        opset: ONNX opset 版本
-        tf_model_dir: TensorFlow 产物目录（用于复制推理所需的 Tokenizer/类别/配置）
-        verify: 是否使用 onnxruntime 做一次前向校验
-
-    返回:
-        str | None: ONNX 模型路径，未导出时返回 None
-    """
-    print("\n" + "="*50)
-    print("步骤8: 导出ONNX模型")
-    print("="*50)
-
-    try:
-        import tf2onnx
-        import onnx
-    except ImportError as e:
-        print(f"⚠️  跳过ONNX导出: 缺少依赖 ({e})")
-        print("   如需自动导出ONNX，请先安装: pip install tf2onnx onnx")
-        return None
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    max_seq_len = config['max_sequence_length']
-    max_filename_len = config['max_filename_length']
-    onnx_path = os.path.join(output_dir, 'textcnn_classifier.onnx')
-
-    print(f"输入形状: text_input=(None, {max_seq_len}), filename_input=(None, {max_filename_len})")
-    print(f"输出路径: {onnx_path}")
-    print(f"opset版本: {opset}")
-
-    # 双输入模型必须显式指定输入签名
-    text_input_spec = tf.TensorSpec(shape=[None, max_seq_len], dtype=tf.int32, name='text_input')
-    filename_input_spec = tf.TensorSpec(shape=[None, max_filename_len], dtype=tf.int32, name='filename_input')
-
-    print("正在转换为ONNX格式...")
-    tf2onnx.convert.from_keras(
-        model,
-        input_signature=[text_input_spec, filename_input_spec],
-        opset=opset,
-        output_path=onnx_path
-    )
-
-    # 校验ONNX模型
-    onnx_model = onnx.load(onnx_path)
-    onnx.checker.check_model(onnx_model)
-    print("✅ ONNX模型校验通过")
-
-    print("\n模型输入:")
-    for inp in onnx_model.graph.input:
-        print(f"  - {inp.name}: {[d.dim_value for d in inp.type.tensor_type.shape.dim]}")
-
-    print("\n模型输出:")
-    for out in onnx_model.graph.output:
-        print(f"  - {out.name}: {[d.dim_value for d in out.type.tensor_type.shape.dim]}")
-
-    # 复制ONNX推理所需的Tokenizer/类别/配置，保证 models/onnx 可独立使用
-    print(f"\n复制推理所需文件到 {output_dir}/ ...")
-    for filename in ONNX_RUNTIME_FILES:
-        src = os.path.join(tf_model_dir, filename)
-        dst = os.path.join(output_dir, filename)
-        if os.path.exists(src):
-            shutil.copy2(src, dst)
-            print(f"  ✅ {filename}")
-        else:
-            print(f"  ⚠️  未找到 {src}，请检查TensorFlow产物目录")
-
-    # 可选：用onnxruntime做一次前向校验
-    if verify:
-        try:
-            import onnxruntime as ort
-
-            session = ort.InferenceSession(onnx_path, providers=['CPUExecutionProvider'])
-            dummy_text = np.zeros((1, max_seq_len), dtype=np.int32)
-            dummy_filename = np.zeros((1, max_filename_len), dtype=np.int32)
-            feed = {}
-            for inp in session.get_inputs():
-                feed[inp.name] = dummy_filename if 'filename' in inp.name.lower() else dummy_text
-            outputs = session.run(None, feed)
-            print(f"\n✅ ONNX Runtime 前向校验通过，输出形状: {outputs[0].shape}")
-        except ImportError:
-            print("\n⚠️  未安装 onnxruntime，跳过前向校验")
-        except Exception as e:
-            print(f"\n⚠️  ONNX Runtime 前向校验失败: {e}")
-
-    print(f"\n✅ ONNX模型已保存: {onnx_path}")
-    return onnx_path
-
-
-def export_onnx_from_saved(keras_path=None, config_path=None):
-    """
-    不重新训练，仅把已保存的Keras模型重新导出为ONNX
-
-    用法: python train.py --export-onnx-only
-    """
-    keras_path = keras_path or os.path.join(TF_MODEL_DIR, 'textcnn_optimized_classifier.keras')
-    config_path = config_path or os.path.join(TF_MODEL_DIR, 'config_optimized.pkl')
-
-    if not os.path.exists(keras_path):
-        print(f"❌ 未找到Keras模型: {keras_path}")
-        print("   请先运行 python train.py 完成训练")
-        return None
-
-    if not os.path.exists(config_path):
-        print(f"❌ 未找到训练配置: {config_path}")
-        return None
-
-    print(f"加载Keras模型: {keras_path}")
-    model = load_model(keras_path, compile=False)
-
-    print(f"加载训练配置: {config_path}")
-    with open(config_path, 'rb') as f:
-        config = pickle.load(f)
-
-    return export_onnx_model(model, config)
-
-
 # ---------- 主流程 ----------
 def main():
+    # 创建训练产物输出目录（模型、Tokenizer、ONNX等统一输出到该目录）
+    ensure_output_dir()
+    
     print("="*50)
-    print("文件学科分类器训练（优化版 - 缓存修复）")
+    print("文件学科分类器训练（优化版）")
     print(f"支持类别: {', '.join(CATEGORIES)}")
     print(f"支持格式: {', '.join(SUPPORTED_EXTENSIONS)}")
     print(f"文本权重: {TEXT_WEIGHT}, 文件名权重: {FILENAME_WEIGHT}")
@@ -1730,18 +1653,14 @@ def main():
     print(f"人名去除: {'启用 (缓存阶段)' if REMOVE_PERSON_NAMES else '禁用'}")
     print(f"词表截断: 限制在 {MAX_NB_WORDS} 词")
     print(f"DOCX支持: {'✅ 已启用' if DOCX_SUPPORT else '❌ 未安装'}")
+    print(f"ONNX导出: {'✅ 训练结束后自动导出' if EXPORT_ONNX else ' 已禁用'} (opset {ONNX_OPSET})")
+    print(f"产物输出目录: {os.path.abspath(OUTPUT_DIR)}")
     
     if SKIP_CATEGORIES:
         print(f"🎯 仅缓存模式科目: {', '.join(SKIP_CATEGORIES)}")
-
-    # 模型输出目录（TensorFlow 与 ONNX 分开放置）
-    ensure_model_dirs()
-    print(f"模型输出目录:")
-    print(f"  - TensorFlow/Keras: {TF_MODEL_DIR}/")
-    print(f"  - ONNX:             {ONNX_MODEL_DIR}/")
-
+    
     print("="*50)
-
+    
     if not os.path.exists(DATA_ROOT):
         print(f"错误: 数据目录不存在 '{DATA_ROOT}'")
         return
@@ -1752,7 +1671,7 @@ def main():
         cache.clear()
     
     # 1. 加载数据
-    print("\n步骤1: 加载文件（使用缓存加速，立即保存）...")
+    print("\n步骤1: 加载文件（使用缓存加速，缓存阶段自动去除人名）...")
     import time
     start_time = time.time()
     texts, filenames, labels, stats = load_data_with_cache(DATA_ROOT)
@@ -1764,10 +1683,7 @@ def main():
     # 打印人名去除详情
     cache = get_cache()
     cache.print_name_removal_summary()
-    cache.print_cache_summary()
     
-    # 最终保存缓存（确保所有数据都已保存）
-    print("\n💾 最终保存缓存...")
     cache.save()
     
     if len(texts) == 0:
@@ -1866,7 +1782,7 @@ def main():
         min_delta=0.0001
     )
     checkpoint = ModelCheckpoint(
-        os.path.join(TF_MODEL_DIR, 'best_model_optimized.keras'),
+        out_path('best_model_optimized.keras'), 
         monitor='val_accuracy', 
         save_best_only=True, 
         mode='max'
@@ -1903,15 +1819,15 @@ def main():
     
     # 8. 保存模型和Tokenizer
     print("\n步骤7: 保存模型...")
-    keras_model_path = os.path.join(TF_MODEL_DIR, 'textcnn_optimized_classifier.keras')
-    model.save(keras_model_path)
-    print(f"✅ 已保存: {keras_model_path}")
-
-    full_text_tokenizer_path = os.path.join(TF_MODEL_DIR, 'text_tokenizer.pkl')
-    full_filename_tokenizer_path = os.path.join(TF_MODEL_DIR, 'filename_tokenizer.pkl')
-    with open(full_text_tokenizer_path, 'wb') as f:
+    keras_model_file = out_path('textcnn_optimized_classifier.keras')
+    model.save(keras_model_file)
+    print(f"✅ 已保存: {keras_model_file}")
+    
+    text_tokenizer_file = out_path('text_tokenizer.pkl')
+    filename_tokenizer_file = out_path('filename_tokenizer.pkl')
+    with open(text_tokenizer_file, 'wb') as f:
         pickle.dump(text_tokenizer, f)
-    with open(full_filename_tokenizer_path, 'wb') as f:
+    with open(filename_tokenizer_file, 'wb') as f:
         pickle.dump(filename_tokenizer, f)
     
     config = {
@@ -1935,48 +1851,48 @@ def main():
     
     save_tokenizers_without_keras(text_tokenizer, filename_tokenizer, CATEGORIES, config)
     save_json_vocabularies(text_tokenizer, filename_tokenizer)
-
-    # 9. 导出ONNX模型（转换已合并进训练流程，一次性完成所有训练工作）
-    onnx_path = None
-    if ENABLE_ONNX_EXPORT:
-        onnx_path = export_onnx_model(model, config)
-    else:
-        print("\n⏭️  已禁用ONNX导出（ENABLE_ONNX_EXPORT = False）")
-
+    
+    # 9. 导出ONNX模型（同一次训练流程直接产出Keras与ONNX两种模型，无需手动转换）
+    onnx_model_file = None
+    if EXPORT_ONNX:
+        onnx_model_file = export_onnx_model(
+            model,
+            max_seq_len=MAX_SEQUENCE_LENGTH,
+            max_filename_len=MAX_FILENAME_LENGTH,
+            verify_samples=(X_test_text_pad[:ONNX_VERIFY_SAMPLES],
+                            X_test_filename_pad[:ONNX_VERIFY_SAMPLES])
+        )
+    
     print("\n" + "="*50)
-    print("训练完成！已保存以下文件:")
-
-    print(f"\n📦 TensorFlow/Keras 产物 ({TF_MODEL_DIR}/):")
-    print("  - textcnn_optimized_classifier.keras")
-    print("  - best_model_optimized.keras")
-    print("  - text_tokenizer.pkl (完整版)")
-    print("  - filename_tokenizer.pkl (完整版)")
-    print("  - text_tokenizer_none.pkl (无依赖版，截断)")
-    print("  - filename_tokenizer_none.pkl (无依赖版，截断)")
-    print("  - categories.pkl")
-    print("  - config_optimized.pkl")
+    print(f"训练完成！产物输出目录: {os.path.abspath(OUTPUT_DIR)}")
+    print("-"*50)
+    print(" 模型文件:")
+    print("  - textcnn_optimized_classifier.keras (完整Keras模型)")
+    print("  - best_model_optimized.keras (验证集最佳模型)")
+    if onnx_model_file:
+        print(f"  - {os.path.basename(onnx_model_file)} (ONNX模型，run/ 下的推理脚本直接使用)")
+    else:
+        print("  - textcnn_classifier.onnx (ONNX模型: 本次未导出)")
+    print("\n📦 推理资源:")
+    print("  - text_tokenizer_none.pkl / filename_tokenizer_none.pkl (无依赖版，截断)")
+    print("  - categories.pkl / config_optimized.pkl")
+    print("  - text_tokenizer.pkl / filename_tokenizer.pkl (完整版)")
+    print("\n📝 JSON词表文件:")
     print("  - text_vocabulary.json (完整文本词表)")
     print("  - text_vocabulary_simple.json (简洁文本词表)")
     print("  - filename_vocabulary.json (完整文件名词表)")
     print("  - filename_vocabulary_simple.json (简洁文件名词表)")
     print("  - word_frequency_report.json (词频统计报告)")
     print("  - category_mapping.json (类别映射)")
-    print("  - training_history.png (训练曲线)")
-
-    print(f"\n🚀 ONNX 推理产物 ({ONNX_MODEL_DIR}/):")
-    if onnx_path:
-        print("  - textcnn_classifier.onnx")
-        for name in ONNX_RUNTIME_FILES:
-            print(f"  - {name}")
-    else:
-        print("  ⚠️  未生成（缺少 tf2onnx/onnx 依赖，可运行: python train.py --export-onnx-only）")
-
     print(f"\n缓存目录: {CACHE_DIR}/")
     print(f"  - file_cache_{CACHE_VERSION}.json")
     print(f"  - cache_metadata_{CACHE_VERSION}.json")
-    print(f"  - cache_debug_{CACHE_VERSION}.log")
     if REMOVE_PERSON_NAMES:
         print(f"  - name_removal_stats_{CACHE_VERSION}.json")
+    print("="*50)
+    print("下一步（运行分类，代码位于 run/ 目录）:")
+    print(f"  python run/predict_onnx.py <文件或目录>   # ONNX预测")
+    print(f"  python run/file_mover.py --preview       # 分类预览")
     print("="*50)
     
     # 可选：保存训练历史
@@ -1999,7 +1915,7 @@ def main():
         axes[1].legend()
         
         plt.tight_layout()
-        history_png = os.path.join(TF_MODEL_DIR, 'training_history.png')
+        history_png = out_path('training_history.png')
         plt.savefig(history_png)
         print(f"训练曲线已保存: {history_png}")
         plt.close()
@@ -2008,23 +1924,6 @@ def main():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="TextCNN 学科分类器训练脚本（训练 + 自动导出 ONNX）"
-    )
-    parser.add_argument("--export-onnx-only", action="store_true",
-                        help="不训练，仅把已保存的 Keras 模型重新导出为 ONNX")
-    parser.add_argument("--keras-model",
-                        default=os.path.join(TF_MODEL_DIR, "textcnn_optimized_classifier.keras"),
-                        help="--export-onnx-only 模式下要转换的 Keras 模型路径")
-    parser.add_argument("--config",
-                        default=os.path.join(TF_MODEL_DIR, "config_optimized.pkl"),
-                        help="--export-onnx-only 模式下使用的训练配置路径")
-    args = parser.parse_args()
-
     random.seed(42)
     np.random.seed(42)
-
-    if args.export_onnx_only:
-        export_onnx_from_saved(keras_path=args.keras_model, config_path=args.config)
-    else:
-        main()
+    main()
